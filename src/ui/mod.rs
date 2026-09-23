@@ -45,6 +45,7 @@ fn drain_msgs(state: &Rc<AppState>, win: &adw::ApplicationWindow, rx: &Receiver<
 pub fn run() {
     let app = adw::Application::builder()
         .application_id("io.github.applauncher")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(build_ui);
     app.run();
@@ -62,6 +63,8 @@ fn load_css() {
     .app-tile:hover { background: alpha(currentColor, 0.07); }
     .app-name { font-size: 13px; }
     .sandbox-chip { opacity: 0.8; }
+    .context-menu { min-width: 170px; }
+    .context-menu list { background: transparent; }
     "#;
     let provider = gtk::CssProvider::new();
     provider.load_from_string(css);
@@ -386,7 +389,7 @@ fn build_tile(
     child.set_child(Some(&overlay));
 
     // context menu (right click / long press)
-    let popover = build_context_menu(&app.id);
+    let popover = build_context_menu(state, win, &app.id);
     popover.set_parent(&child);
 
     // single click: launch, no confirmation
@@ -436,12 +439,83 @@ fn build_tile(
     child
 }
 
-fn build_context_menu(app_id: &str) -> gtk::PopoverMenu {
-    let menu = gio::Menu::new();
-    menu.append(Some("启动"), Some(&format!("app.launch('{app_id}')")));
-    menu.append(Some("设置沙盒…"), Some(&format!("app.sandbox('{app_id}')")));
-    menu.append(Some("删除…"), Some(&format!("app.remove('{app_id}')")));
-    gtk::PopoverMenu::from_model(Some(&menu))
+/// Build the tile context menu as a manual Popover with direct button
+/// handlers. (A Gio MenuModel + PopoverMenu resolves item actions through the
+/// widget action muxer, which proved unreliable for popped-up menus; direct
+/// closures are always clickable.)
+fn build_context_menu(
+    state: &Rc<AppState>,
+    win: &adw::ApplicationWindow,
+    app_id: &str,
+) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("context-menu");
+    popover.set_autohide(true);
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("rich-list");
+    list.set_margin_top(6);
+    list.set_margin_bottom(6);
+
+    let add_item = |list: &gtk::ListBox, icon: &str, label: &str| -> gtk::Button {
+        let row = gtk::ListBoxRow::new();
+        row.set_activatable(false);
+        let btn = gtk::Button::new();
+        btn.set_has_frame(false);
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        hbox.set_margin_start(10);
+        hbox.set_margin_end(10);
+        hbox.set_margin_top(4);
+        hbox.set_margin_bottom(4);
+        let img = gtk::Image::from_icon_name(icon);
+        hbox.append(&img);
+        let lbl = gtk::Label::new(Some(label));
+        lbl.set_halign(gtk::Align::Start);
+        lbl.set_hexpand(true);
+        hbox.append(&lbl);
+        btn.set_child(Some(&hbox));
+        row.set_child(Some(&btn));
+        list.append(&row);
+        btn
+    };
+
+    let pop = popover.clone();
+    let launch_btn = add_item(&list, "media-playback-start-symbolic", "启动");
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let id = app_id.to_string();
+        launch_btn.connect_clicked(move |_| {
+            pop.popdown();
+            launch_app(&state, &win, &id);
+        });
+    }
+    let pop = popover.clone();
+    let sandbox_btn = add_item(&list, "security-high-symbolic", "设置沙盒…");
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let id = app_id.to_string();
+        sandbox_btn.connect_clicked(move |_| {
+            pop.popdown();
+            sandbox_dialog::present(&win, &state, &id);
+        });
+    }
+    let pop = popover.clone();
+    let remove_btn = add_item(&list, "user-trash-symbolic", "删除…");
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let id = app_id.to_string();
+        remove_btn.connect_clicked(move |_| {
+            pop.popdown();
+            confirm_remove(&win, &state, &id);
+        });
+    }
+
+    popover.set_child(Some(&list));
+    popover
 }
 
 /// Kick off a launch: DNS resolution happens on a worker thread, then the
