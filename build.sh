@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build script for app-launcher.
+# Build script for jail (top.llklkl.jail).
 #
 # The system lacks gtk4/libadwaita -devel packages, so we use a local sysroot
 # (extracted from Fedora RPMs) for headers + pkg-config, while linking against
@@ -29,7 +29,7 @@ case "${1:-build}" in
     ;;
   run)
     cargo build
-    exec ./target/debug/app-launcher
+    exec ./target/debug/jail
     ;;
   test)
     cargo test

@@ -81,11 +81,11 @@ pub fn resolve_domains(domains: &[String]) -> (Vec<IpAddr>, Vec<String>) {
 /// enforced by the host-side bridge, which sees real hostnames.
 pub fn build_nft_script(cfg: &SandboxConfig, _resolved: &[IpAddr]) -> String {
     let mut lines = String::from(
-        "add table inet applauncher\n\
-         add chain inet applauncher output { type filter hook output priority 0; policy drop; }\n",
+        "add table inet jail\n\
+         add chain inet jail output { type filter hook output priority 0; policy drop; }\n",
     );
     if cfg.allow_loopback {
-        lines.push_str("add rule inet applauncher output oifname \"lo\" accept\n");
+        lines.push_str("add rule inet jail output oifname \"lo\" accept\n");
     }
     lines
 }
@@ -123,7 +123,7 @@ mod tests {
             allow_loopback: true,
         };
         let script = build_nft_script(&cfg, &["1.2.3.4".parse().unwrap()]);
-        assert!(script.contains("add table inet applauncher"));
+        assert!(script.contains("add table inet jail"));
         assert!(script.contains("policy drop"));
         assert!(script.contains("oifname \"lo\" accept"));
         // allowlist lives in the host bridge, not in nft rules

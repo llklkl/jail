@@ -1,8 +1,8 @@
 [package]
-name = "app-launcher"
+name = "jail"
 version = "0.1.0"
 edition = "2021"
-description = "Linux app launcher with per-app network sandboxing (MD3 UI)"
+description = "top.llklkl.jail — Linux app launcher with per-app network sandboxing (MD3 UI)"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }

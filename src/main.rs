@@ -15,7 +15,7 @@ fn main() {
         let allow_json = std::fs::read_to_string(&args[3]).expect("read allowlist file");
         let allow: proxy::AllowList = serde_json::from_str(&allow_json).expect("parse allowlist");
         if let Err(e) = proxy::run_host_bridge(&socket_path, allow) {
-            eprintln!("app-launcher bridge: {e}");
+            eprintln!("jail bridge: {e}");
             std::process::exit(1);
         }
         return;
@@ -23,7 +23,7 @@ fn main() {
     if args.len() >= 3 && args[1] == "--ns-relay" {
         let socket_path = args[2].clone();
         if let Err(e) = proxy::run_ns_relay(socket_path) {
-            eprintln!("app-launcher ns-relay: {e}");
+            eprintln!("jail ns-relay: {e}");
             std::process::exit(1);
         }
         return;

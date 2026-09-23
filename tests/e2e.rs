@@ -1,5 +1,5 @@
-use app_launcher::launcher::{self, LaunchMode};
-use app_launcher::model::AppEntry;
+use jail::launcher::{self, LaunchMode};
+use jail::model::AppEntry;
 
 /// End-to-end: spawn a "fake app" through the real sandboxed spawn path and
 /// verify the allowlist holds. Requires the sandbox prerequisites

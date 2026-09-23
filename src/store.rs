@@ -13,7 +13,7 @@ impl Store {
     pub fn new() -> Self {
         let base = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("app-launcher");
+            .join("jail");
         Self { path: base.join("apps.json") }
     }
 
@@ -35,7 +35,7 @@ impl Store {
                 Ok(list) => list,
                 Err(e) => {
                     eprintln!(
-                        "app-launcher: corrupt {}: {e}; backing up and starting fresh",
+                        "jail: corrupt {}: {e}; backing up and starting fresh",
                         self.path.display()
                     );
                     let _ = fs::rename(&self.path, self.path.with_extension("json.bak"));

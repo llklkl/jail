@@ -65,7 +65,7 @@ src/
 ├── main.rs           入口：GUI / --bridge / --ns-relay 子命令
 ├── lib.rs            库 facade（供集成测试复用）
 ├── model.rs          AppEntry / SandboxConfig / Exec 字段码剥离
-├── store.rs          ~/.config/app-launcher/apps.json 原子读写
+├── store.rs          ~/.config/jail/apps.json 原子读写
 ├── desktop_scan.rs   XDG + flatpak desktop 文件扫描
 ├── sandbox.rs        nft 规则生成、域名解析
 ├── proxy.rs          沙盒代理：宿主 bridge（白名单执行）+ ns relay（CONNECT/DNS）

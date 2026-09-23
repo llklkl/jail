@@ -44,7 +44,7 @@ fn drain_msgs(state: &Rc<AppState>, win: &adw::ApplicationWindow, rx: &Receiver<
 
 pub fn run() {
     let app = adw::Application::builder()
-        .application_id("io.github.applauncher")
+        .application_id("top.llklkl.jail")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(build_ui);
@@ -98,12 +98,12 @@ fn build_ui(app: &adw::Application) {
     });
 
     let win = adw::ApplicationWindow::new(app);
-    win.set_title(Some("应用启动器"));
+    win.set_title(Some("Jail 启动器"));
     win.set_default_size(900, 640);
 
     // --- header bar -------------------------------------------------------
     let header = adw::HeaderBar::new();
-    let title = gtk::Label::new(Some("应用启动器"));
+    let title = gtk::Label::new(Some("Jail 启动器"));
     title.add_css_class("title");
     header.set_title_widget(Some(&title));
 
@@ -173,11 +173,11 @@ fn build_ui(app: &adw::Application) {
         let about = gio::SimpleAction::new("about", None);
         about.connect_activate(move |_, _| {
             let dlg = adw::AboutDialog::builder()
-                .application_name("应用启动器")
+                .application_name("Jail 启动器")
                 .application_icon("application-x-executable")
                 .developer_name("App Launcher")
                 .version(env!("CARGO_PKG_VERSION"))
-                .comments("Linux 应用启动器，支持按应用限制网络访问（域名 / IP）。")
+                .comments("Linux 应用启动器（top.llklkl.jail），支持按应用限制网络访问（域名 / IP）。")
                 .license_type(gtk::License::MitX11)
                 .build();
             dlg.present(Some(&win));

@@ -96,7 +96,7 @@ pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
     }
     let (resolved, failed) = sandbox::resolve_domains(&app.sandbox.allow_domains);
     if !failed.is_empty() {
-        eprintln!("app-launcher: could not resolve domains: {failed:?}");
+        eprintln!("jail: could not resolve domains: {failed:?}");
     }
     let nft_script = sandbox::build_nft_script(&app.sandbox, &resolved);
     let allow = AllowList {
@@ -111,7 +111,7 @@ pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
         loopback: app.sandbox.allow_loopback,
     };
     let bridge_path = std::env::temp_dir().join(format!(
-        "applauncher-bridge-{}-{}.sock",
+        "jail-bridge-{}-{}.sock",
         std::process::id(),
         &app.id[..8.min(app.id.len())]
     ));
@@ -138,19 +138,19 @@ fn write_temp_file(prefix: &str, content: &str) -> std::io::Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// Path of the app-launcher binary used for --bridge / --ns-relay helpers.
+/// Path of the jail binary used for --bridge / --ns-relay helpers.
 /// `current_exe()` points at the test binary under `cargo test`, so prefer
-/// the sibling `app-launcher` binary when it exists.
+/// the sibling `jail` binary when it exists.
 fn helper_exe() -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let candidate = dir.join("app-launcher");
+    let candidate = dir.join("jail");
     if candidate.exists() {
         return Ok(candidate);
     }
-    // target/debug/deps/e2e-xxxx -> target/debug/app-launcher
+    // target/debug/deps/e2e-xxxx -> target/debug/jail
     if let Some(deps) = dir.parent() {
-        let candidate = deps.join("app-launcher");
+        let candidate = deps.join("jail");
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -166,7 +166,7 @@ fn helper_exe() -> std::io::Result<std::path::PathBuf> {
 ///   ip link set lo up
 ///   nft -f <rules>
 ///   mount --bind <resolv.conf> /etc/resolv.conf
-///   app-launcher --ns-relay <bridge.sock> &     # proxy inside ns
+///   jail --ns-relay <bridge.sock> &     # proxy inside ns
 ///   exec <app>                                   # with proxy env vars
 /// '
 /// ```
@@ -190,7 +190,7 @@ pub fn spawn_app(app: &AppEntry, mode: &LaunchMode) -> Result<RunningApp, Launch
             let allow_json = serde_json::to_string(allow)
                 .map_err(|e| LaunchError::Sandbox(e.to_string()))?;
             let allow_file =
-                write_temp_file("applauncher-allow", &allow_json).map_err(LaunchError::Spawn)?;
+                write_temp_file("jail-allow", &allow_json).map_err(LaunchError::Spawn)?;
             let bridge = Command::new(&self_exe)
                 .args(["--bridge", bridge_path, &allow_file])
                 .stdout(Stdio::null())
@@ -200,9 +200,9 @@ pub fn spawn_app(app: &AppEntry, mode: &LaunchMode) -> Result<RunningApp, Launch
             std::mem::forget(bridge); // detached; exits when the socket is gone
 
             // 2. prepare ns-side files
-            let nft_file = write_temp_file("applauncher-nft", nft_script)
+            let nft_file = write_temp_file("jail-nft", nft_script)
                 .map_err(LaunchError::Spawn)?;
-            let resolv_file = write_temp_file("applauncher-resolv", "nameserver 127.0.0.1\n")
+            let resolv_file = write_temp_file("jail-resolv", "nameserver 127.0.0.1\n")
                 .map_err(LaunchError::Spawn)?;
 
             // 3. inner script

@@ -12,19 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "app-launcher"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "freedesktop-desktop-entry",
- "gtk4",
- "libadwaita",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -542,6 +529,19 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jail"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "freedesktop-desktop-entry",
+ "gtk4",
+ "libadwaita",
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "js-sys"
