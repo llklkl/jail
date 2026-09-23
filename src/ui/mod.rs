@@ -67,6 +67,15 @@ fn load_css() {
     .sandbox-chip { opacity: 0.8; }
     .context-menu { min-width: 170px; }
     .context-menu list { background: transparent; }
+    .log-chip {
+        border-radius: 9999px;
+        padding: 2px 10px;
+        font-size: 11px;
+        font-weight: 700;
+    }
+    .log-chip-allowed { background: alpha(@success_color, 0.22); color: @success_color; }
+    .log-chip-denied { background: alpha(@error_color, 0.22); color: @error_color; }
+    .log-chip-mixed { background: alpha(@warning_color, 0.22); color: @warning_color; }
     "#;
     let provider = gtk::CssProvider::new();
     provider.load_from_string(css);

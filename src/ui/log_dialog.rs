@@ -93,11 +93,9 @@ pub fn present(win: &adw::ApplicationWindow, app: &AppEntry, log_path: PathBuf) 
                 .first()
                 .map(|h| h.last_ts)
                 .unwrap_or(0);
-            // rebuild summary
-            let mut idx = 0;
-            while let Some(child) = summary_list.row_at_index(idx) {
+            // rebuild summary (always remove row 0: rows shift on removal)
+            while let Some(child) = summary_list.row_at_index(0) {
                 summary_list.remove(&child);
-                idx += 1;
             }
             let rows = summarize(&text, MAX_SUMMARY_ROWS);
             if rows.is_empty() {
@@ -240,6 +238,21 @@ fn summary_row(h: &super::log_data::HostSummary) -> gtk::ListBoxRow {
     hbox.set_margin_start(8);
     hbox.set_margin_end(8);
 
+    // verdict chip: the most prominent element, colored green/red
+    let (chip_label, chip_class, chip_tooltip) = if h.denied > 0 && h.allowed > 0 {
+        ("部分放行", "log-chip-mixed", "有放行也有拒绝的连接")
+    } else if h.denied > 0 {
+        ("已拒绝", "log-chip-denied", "所有连接都被白名单拒绝")
+    } else {
+        ("已放行", "log-chip-allowed", "连接被白名单放行")
+    };
+    let chip = gtk::Label::new(Some(chip_label));
+    chip.set_valign(gtk::Align::Center);
+    chip.add_css_class("log-chip");
+    chip.add_css_class(chip_class);
+    chip.set_tooltip_text(Some(chip_tooltip));
+    hbox.append(&chip);
+
     // host + verdict counts
     let left = gtk::Box::new(gtk::Orientation::Vertical, 2);
     left.set_valign(gtk::Align::Center);
@@ -250,10 +263,10 @@ fn summary_row(h: &super::log_data::HostSummary) -> gtk::ListBoxRow {
     left.append(&name);
     let mut counts = Vec::new();
     if h.allowed > 0 {
-        counts.push(format!("✓ {}", h.allowed));
+        counts.push(format!("✓ 放行 {}", h.allowed));
     }
     if h.denied > 0 {
-        counts.push(format!("✗ {}", h.denied));
+        counts.push(format!("✗ 拒绝 {}", h.denied));
     }
     if h.dns > 0 {
         counts.push(format!("DNS {}", h.dns));
