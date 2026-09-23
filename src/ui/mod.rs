@@ -293,8 +293,18 @@ fn confirm_remove(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) 
 fn find_grid(win: &adw::ApplicationWindow) -> Option<(gtk::FlowBox, gtk::Stack)> {
     let view = win.content()?.downcast::<adw::ToolbarView>().ok()?;
     let stack = view.content()?.downcast::<gtk::Stack>().ok()?;
-    let scroll = stack.child_by_name("grid")?.downcast::<gtk::ScrolledWindow>().ok()?;
-    let flowbox = scroll.child()?.downcast::<gtk::FlowBox>().ok()?;
+    let scroll = stack
+        .child_by_name("grid")?
+        .downcast::<gtk::ScrolledWindow>()
+        .ok()?;
+    // GTK4 auto-wraps non-scrollable children in a GtkViewport; FlowBox does not
+    // implement GtkScrollable, so the FlowBox lives inside the viewport.
+    let inner = scroll.child()?;
+    let flowbox = if inner.is::<gtk::Viewport>() {
+        inner.downcast::<gtk::Viewport>().ok()?.child()?.downcast::<gtk::FlowBox>().ok()?
+    } else {
+        inner.downcast::<gtk::FlowBox>().ok()?
+    };
     Some((flowbox, stack))
 }
 
