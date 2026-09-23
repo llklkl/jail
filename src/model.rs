@@ -3,10 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-/// A sandbox allowlist entry: a domain (suffix match) or an IP / CIDR.
+/// A sandbox allowlist entry: a domain (exact, or `*.example.com` wildcard
+/// matching exactly one subdomain label) or an IP / CIDR.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
-    /// domain name, suffix match ("example.com" matches api.example.com)
+    /// domain name: `example.com` matches only itself;
+    /// `*.example.com` matches exactly one extra label (api.example.com,
+    /// but not a.b.example.com and not example.com itself)
     Domain,
     /// single IP address
     Ip,
@@ -36,15 +39,25 @@ pub fn classify_entry(raw: &str) -> Option<EntryKind> {
     } else if s.parse::<IpAddr>().is_ok() {
         Some(EntryKind::Ip)
     } else {
-        // A domain: letters/digits/hyphen labels separated by dots. We keep
-        // this permissive (no punycode validation) but reject whitespace,
+        // A domain: letters/digits/hyphen labels separated by dots, with an
+        // optional leftmost wildcard label (`*.example.com`). We keep this
+        // permissive (no punycode validation) but reject whitespace,
         // slashes, ports and other obvious garbage.
         if s.chars().any(|c| {
             c.is_whitespace() || matches!(c, '/' | '\\' | ':' | '@' | '?' | '#' | '%' | ',')
         }) {
             return None;
         }
-        if s.split('.').any(|label| label.is_empty()) {
+        let labels: Vec<&str> = s.split('.').collect();
+        if labels.iter().any(|l| l.is_empty()) {
+            return None;
+        }
+        let wildcard = labels.first() == Some(&"*");
+        if wildcard && labels.len() < 2 {
+            return None; // bare "*"
+        }
+        // '*' is only allowed as the entire first label (no a.*.com, no api*.com)
+        if labels.iter().enumerate().any(|(i, l)| l.contains('*') && !(wildcard && i == 0)) {
             return None;
         }
         Some(EntryKind::Domain)
@@ -234,6 +247,8 @@ mod tests {
     fn classify_entries() {
         assert_eq!(classify_entry("example.com"), Some(EntryKind::Domain));
         assert_eq!(classify_entry(" EXAMPLE.com "), Some(EntryKind::Domain));
+        assert_eq!(classify_entry("*.example.com"), Some(EntryKind::Domain));
+        assert_eq!(classify_entry("*.api.example.com"), Some(EntryKind::Domain));
         assert_eq!(classify_entry("10.0.0.1"), Some(EntryKind::Ip));
         assert_eq!(classify_entry("fe80::1"), Some(EntryKind::Ip));
         assert_eq!(classify_entry("10.0.0.0/8"), Some(EntryKind::Cidr { plen: 8 }));
@@ -248,6 +263,10 @@ mod tests {
         assert_eq!(classify_entry("host:443"), None); // port smuggled in
         assert_eq!(classify_entry("a/b/c"), None); // slash garbage
         assert_eq!(classify_entry("10.0.0.1:443"), None); // ip:port
+        assert_eq!(classify_entry("*"), None); // bare wildcard
+        assert_eq!(classify_entry("a.*.com"), None); // wildcard not leftmost
+        assert_eq!(classify_entry("api*.com"), None); // partial wildcard label
+        assert_eq!(classify_entry("*.*.com"), None); // double wildcard
     }
 
     #[test]

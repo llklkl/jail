@@ -91,6 +91,10 @@ fn default_true() -> bool {
 impl AllowList {
     /// Check a host (name or IP); returns the matching reason for logging:
     /// "loopback" | "domain" | "ip" | "cidr".
+    ///
+    /// Domain entries match by label: `example.com` matches only itself;
+    /// `*.example.com` matches exactly one extra label (api.example.com,
+    /// not a.b.example.com, not example.com itself).
     pub fn match_reason(&self, host: &str) -> Option<&'static str> {
         let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
         if host == "localhost" || host.starts_with("127.") || host == "::1" {
@@ -99,8 +103,7 @@ impl AllowList {
         for e in &self.entries {
             match classify_entry(e) {
                 Some(EntryKind::Domain) => {
-                    let d = e.trim().to_ascii_lowercase();
-                    if host == d || host.ends_with(&format!(".{d}")) {
+                    if domain_entry_matches(e.trim(), &host) {
                         return Some("domain");
                     }
                 }
@@ -127,6 +130,30 @@ impl AllowList {
     #[allow(dead_code)] // convenience wrapper; match_reason is the primary API
     pub fn matches(&self, host: &str) -> bool {
         self.match_reason(host).is_some()
+    }
+}
+
+/// Domain entry vs host matching, by label count:
+///   entry "example.com"    → host must equal "example.com"
+///   entry "*.example.com"  → host must be "example.com" plus exactly one
+///                            extra label (api.example.com ✓,
+///                            a.b.example.com ✗, example.com ✗)
+/// Both sides are lowercased first. Entries are pre-validated by
+/// `classify_entry`, so '*' can only appear as the whole first label.
+fn domain_entry_matches(entry: &str, host: &str) -> bool {
+    let entry = entry.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    match entry.strip_prefix("*.") {
+        Some(base) => {
+            if base.is_empty() {
+                return false;
+            }
+            match host.strip_suffix(&format!(".{base}")) {
+                Some(prefix) => !prefix.is_empty() && !prefix.contains('.'),
+                None => false,
+            }
+        }
+        None => entry == host,
     }
 }
 
@@ -901,13 +928,34 @@ mod tests {
 
     #[test]
     fn allowlist_domains() {
+        // exact match: no implicit subdomains anymore
         let a = allow(&["example.com"], true);
         assert_eq!(a.match_reason("example.com"), Some("domain"));
-        assert_eq!(a.match_reason("api.example.com"), Some("domain"));
+        assert_eq!(a.match_reason("api.example.com"), None);
+        assert_eq!(a.match_reason("a.b.example.com"), None);
         assert_eq!(a.match_reason("notexample.com"), None);
         assert_eq!(a.match_reason("github.com"), None);
         assert_eq!(a.match_reason("localhost"), Some("loopback"));
         assert_eq!(a.match_reason("127.0.0.1"), Some("loopback"));
+    }
+
+    #[test]
+    fn allowlist_wildcard_domains() {
+        // wildcard: exactly one extra label
+        let a = allow(&["*.example.com"], false);
+        assert_eq!(a.match_reason("api.example.com"), Some("domain"));
+        assert_eq!(a.match_reason("API.Example.COM"), Some("domain"));
+        assert_eq!(a.match_reason("example.com"), None); // base itself not covered
+        assert_eq!(a.match_reason("a.b.example.com"), None); // two extra labels
+        assert_eq!(a.match_reason("notexample.com"), None);
+        // deeper wildcard: one label at that depth
+        let b = allow(&["*.api.example.com"], false);
+        assert_eq!(b.match_reason("v1.api.example.com"), Some("domain"));
+        assert_eq!(b.match_reason("api.example.com"), None);
+        assert_eq!(b.match_reason("x.v1.api.example.com"), None);
+        // case-insensitive entry
+        let c = allow(&["*.EXAMPLE.com"], false);
+        assert_eq!(c.match_reason("api.example.com"), Some("domain"));
     }
 
     #[test]

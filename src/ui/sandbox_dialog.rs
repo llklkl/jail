@@ -10,7 +10,13 @@ use std::rc::Rc;
 
 fn entry_subtitle(e: &str) -> String {
     match classify_entry(e) {
-        Some(EntryKind::Domain) => "域名 · 后缀匹配（含子域名）".into(),
+        Some(EntryKind::Domain) => {
+            if e.trim().starts_with("*.") {
+                "通配 · 匹配一级子域名".into()
+            } else {
+                "域名 · 精确匹配".into()
+            }
+        }
         Some(EntryKind::Ip) => "单个 IP 地址".into(),
         Some(EntryKind::Cidr { plen }) => format!("网段 · CIDR /{plen}"),
         None => "无效条目".into(),
@@ -51,7 +57,7 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
     let allow_group = adw::PreferencesGroup::new();
     allow_group.set_title("允许访问的地址");
     allow_group.set_description(Some(
-        "每行一条：域名（如 example.com，含子域名）、IP 或网段（如 10.0.0.0/8）。未列出的地址将被拒绝。",
+        "每行一条：域名精确匹配（example.com）；*.example.com 通配一级子域名；IP 或网段（10.0.0.0/8）。未列出的地址将被拒绝。",
     ));
 
     // Rows for existing entries. The list lives in a Vec we rebuild on save;
@@ -96,7 +102,7 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
         .title("添加条目")
         .show_apply_button(true)
         .build();
-    input_row.set_tooltip_text(Some("例如: example.com、10.0.0.1、192.168.1.0/24"));
+    input_row.set_tooltip_text(Some("例如: example.com、*.example.com、10.0.0.1、192.168.1.0/24"));
     allow_group.add(&input_row);
 
     let loopback_switch = adw::SwitchRow::builder()

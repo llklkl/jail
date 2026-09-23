@@ -35,7 +35,8 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
         fake_app.to_string_lossy().into_owned(),
     );
     app.sandbox.enabled = true;
-    app.sandbox.allow_entries = vec!["baidu.com".into()];
+    // exact entry for the CONNECT host + wildcard exercising subdomain match
+    app.sandbox.allow_entries = vec!["www.baidu.com".into(), "*.baidu.com".into()];
 
     let mode = launcher::prepare_launch_in(&cfg_dir, &app).unwrap();
     let LaunchMode::Sandboxed { log_path, .. } = &mode else {
