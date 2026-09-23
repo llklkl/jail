@@ -1,6 +1,7 @@
 mod desktop_scan;
 mod launcher;
 mod model;
+mod output_log;
 mod proxy;
 mod sandbox;
 mod store;

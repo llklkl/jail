@@ -3,11 +3,13 @@
 mod add_dialog;
 mod log_data;
 mod log_dialog;
+mod output_log_dialog;
 mod sandbox_dialog;
 
 use crate::desktop_scan::{self, DesktopApp};
 use crate::launcher::{self, LaunchMode, RunningRegistry};
 use crate::model::{strip_field_codes, AppEntry};
+use crate::output_log::OutputLogRegistry;
 use crate::store::Store;
 use gtk::{glib, gio};
 use adw::prelude::*;
@@ -32,6 +34,8 @@ pub struct AppState {
     pub store: Store,
     pub apps: RefCell<Vec<AppEntry>>,
     pub registry: Arc<RunningRegistry>,
+    /// In-memory stdout/stderr capture per app (most recent run).
+    pub logs: Arc<OutputLogRegistry>,
     /// badge widget per app id (refreshed on grid rebuild)
     pub badges: RefCell<HashMap<String, gtk::Widget>>,
     pub tx: Sender<UiMsg>,
@@ -94,6 +98,7 @@ fn build_ui(app: &adw::Application) {
     let store = Store::new();
     let apps = store.load();
     let registry: Arc<RunningRegistry> = Arc::new(RunningRegistry::default());
+    let logs: Arc<OutputLogRegistry> = Arc::new(OutputLogRegistry::default());
 
     // Channel from worker threads to the UI loop (std mpsc, drained by a
     // periodic source on the main loop).
@@ -104,6 +109,7 @@ fn build_ui(app: &adw::Application) {
         store,
         apps: RefCell::new(apps),
         registry,
+        logs,
         badges: RefCell::new(HashMap::new()),
         tx,
     });
@@ -297,6 +303,7 @@ fn confirm_remove(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) 
         alert.connect_response(Some("delete"), move |_, _| {
             state.apps.borrow_mut().retain(|a| a.id != id);
             state.registry.remove(&id);
+            state.logs.remove(&id);
             after_mutation(&state, &win);
         });
     }
@@ -525,6 +532,17 @@ fn build_context_menu(
         });
     }
     let pop = popover.clone();
+    let output_btn = add_item(&list, "utilities-terminal-symbolic", "运行日志…");
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let id = app_id.to_string();
+        output_btn.connect_clicked(move |_| {
+            pop.popdown();
+            open_output_log_dialog(&win, &state, &id);
+        });
+    }
+    let pop = popover.clone();
     let remove_btn = add_item(&list, "user-trash-symbolic", "删除…");
     {
         let state = state.clone();
@@ -553,6 +571,18 @@ fn open_log_dialog(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str)
     log_dialog::present(win, &app, log_path);
 }
 
+/// Open the run-output dialog for one app: the in-memory capture of its most
+/// recent run's stdout/stderr (empty view when it never ran this session).
+fn open_output_log_dialog(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
+    let Some(app) = state.apps.borrow().iter().find(|a| a.id == id).cloned() else {
+        return;
+    };
+    let log = state.logs.get(id);
+    let registry = state.registry.clone();
+    let id = id.to_string();
+    output_log_dialog::present(win, &app, log, move || registry.is_running(&id));
+}
+
 /// Kick off a launch: DNS resolution happens on a worker thread, then the
 /// spawn + badge update happen on the UI thread via the message channel.
 pub fn launch_app(state: &Rc<AppState>, win: &adw::ApplicationWindow, id: &str) {
@@ -573,7 +603,7 @@ pub fn launch_app(state: &Rc<AppState>, win: &adw::ApplicationWindow, id: &str) 
 
 fn handle_msg(state: &Rc<AppState>, win: &adw::ApplicationWindow, msg: UiMsg) {
     match msg {
-        UiMsg::LaunchReady(app, mode) => match launcher::spawn_app(&app, &mode) {
+        UiMsg::LaunchReady(app, mode) => match launcher::spawn_app(&app, &mode, &state.logs) {
             Ok(running) => {
                 let handle = state.registry.insert(running);
                 if let Some(badge) = state.badges.borrow().get(&app.id) {

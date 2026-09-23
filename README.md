@@ -12,8 +12,11 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格），支持按
   启用了沙盒的应用显示盾牌角标
 - **交互**：
   - 单击应用 = 直接启动（无确认）
-  - 右键 / 长按 = 菜单：启动、设置沙盒…、删除…
+  - 右键 / 长按 = 菜单：启动、设置沙盒…、访问日志…、运行日志…、删除…
   - 删除需弹窗确认（仅移除启动器条目，不卸载应用）
+  - 访问日志（AdwDialog）：按主机汇总放行/拒绝/DNS 与流量，附原始 JSONL 视图
+  - 运行日志（AdwDialog）：实时查看应用 stdout/stderr，内存环形缓冲上限 1 MB，
+    自动丢弃最早输出，**不写入磁盘**；应用退出后仍可查看，下次启动时重置
   - 沙盒设置为应用内模态窗（AdwDialog）：启用开关、允许的域名、允许的 IP/网段、
     回环/DNS 开关、域名解析预览
 - **网络沙盒**（每个应用独立配置）：
@@ -67,17 +70,19 @@ src/
 ├── model.rs          AppEntry / SandboxConfig / Exec 字段码剥离
 ├── store.rs          ~/.config/jail/apps.json 原子读写
 ├── desktop_scan.rs   XDG + flatpak desktop 文件扫描
+├── output_log.rs     应用输出内存环形缓冲（1 MB 上限，不落地）
 ├── sandbox.rs        nft 规则生成、域名解析
 ├── proxy.rs          沙盒代理：宿主 bridge（白名单执行）+ ns relay（CONNECT/DNS）
 ├── launcher.rs       启动编排：unshare + nft + mount + 代理环境 + 进程跟踪
-└── ui/               主窗口、应用网格、添加对话框、沙盒模态窗、删除确认
+└── ui/               主窗口、应用网格、添加对话框、沙盒模态窗、访问/运行日志、删除确认
 ```
 
 ## 测试
 
-`./build.sh test` 包含 21 个测试：
+`./build.sh test` 包含 44 个测试：
 
 - 单元测试：字段码剥离、store 读写/损坏恢复、IP/CIDR 解析、nft 脚本形状、
-  白名单匹配（域名后缀 / CIDR / loopback）、真实进程 spawn
+  白名单匹配（域名后缀 / CIDR / loopback）、输出环形缓冲（轮转 / 硬截 / registry）、
+  真实进程 spawn（含 stdout/stderr 捕获与重置）
 - 端到端（`tests/e2e.rs`）：通过真实 `spawn_app` 路径启动沙盒内"假应用"，
-  验证白名单域名可达（HTTP 200）、非白名单域名被拒
+  验证白名单域名可达（HTTP 200）、非白名单域名被拒、请求日志与输出捕获

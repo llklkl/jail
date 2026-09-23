@@ -1,5 +1,6 @@
 use jail::launcher::{self, LaunchMode};
 use jail::model::AppEntry;
+use jail::output_log::OutputLogRegistry;
 
 /// End-to-end: spawn a "fake app" through the real sandboxed spawn path and
 /// verify the allowlist holds AND the request log records the traffic.
@@ -42,7 +43,8 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
     let LaunchMode::Sandboxed { log_path, .. } = &mode else {
         panic!("expected sandboxed mode");
     };
-    let mut running = launcher::spawn_app(&app, &mode).unwrap();
+    let logs = OutputLogRegistry::default();
+    let mut running = launcher::spawn_app(&app, &mode, &logs).unwrap();
     assert!(running.sandboxed);
 
     // wait for the fake app to finish probing
@@ -108,6 +110,15 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
         ip_conn.contains("attr:") || ip_conn.contains("domain"),
         "by-IP connect matched through attribution: {ip_conn}"
     );
+
+    // 4. run-output capture: the fake app's stdout/stderr landed in the
+    //    in-memory ring buffer (never on disk)
+    let out = logs.get(&app.id).expect("output log registered for fake app");
+    let (buf, total) = out.snapshot();
+    eprintln!("--- captured output ({total} bytes) ---\n{buf}");
+    assert!(buf.contains("fakeapp-stdout-marker"), "stdout captured: {buf:?}");
+    assert!(buf.contains("fakeapp-stderr-marker"), "stderr captured: {buf:?}");
+    assert!(total > 0);
 
     let _ = std::fs::remove_dir_all(&cfg_dir);
 }

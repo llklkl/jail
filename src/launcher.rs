@@ -2,9 +2,11 @@
 //! process-group tracking so the UI can show/hide the running badge.
 
 use crate::model::AppEntry;
+use crate::output_log::{OutputLog, OutputLogRegistry};
 use crate::proxy::AllowList;
 use crate::sandbox;
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -198,6 +200,10 @@ fn helper_exe() -> std::io::Result<std::path::PathBuf> {
 
 /// Spawn the app.
 ///
+/// The app's stdout/stderr are captured into an in-memory ring buffer (1 MiB
+/// cap, never written to disk) keyed by app id in `logs`; the previous run's
+/// log is replaced on each launch.
+///
 /// Sandboxed layout:
 /// ```text
 /// unshare -Urnm --map-root-user sh -c '
@@ -209,9 +215,14 @@ fn helper_exe() -> std::io::Result<std::path::PathBuf> {
 /// '
 /// ```
 /// The host side runs `--bridge <bridge.sock> <allowlist.json>` before spawn.
-pub fn spawn_app(app: &AppEntry, mode: &LaunchMode) -> Result<RunningApp, LaunchError> {
+pub fn spawn_app(
+    app: &AppEntry,
+    mode: &LaunchMode,
+    logs: &OutputLogRegistry,
+) -> Result<RunningApp, LaunchError> {
     let self_exe = helper_exe().map_err(LaunchError::Spawn)?;
     let exec = &app.exec;
+    let out_log = logs.reset(&app.id);
 
     let mut cmd = match mode {
         LaunchMode::Plain => {
@@ -277,23 +288,48 @@ pub fn spawn_app(app: &AppEntry, mode: &LaunchMode) -> Result<RunningApp, Launch
             c
         }
     };
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .process_group(0);
     match cmd.spawn() {
-        Ok(child) => Ok(RunningApp {
-            app_id: app.id.clone(),
-            pid: child.id(),
-            sandboxed: matches!(mode, LaunchMode::Sandboxed { .. }),
-            child: Some(child),
-            bridge_path: match mode {
-                LaunchMode::Sandboxed { bridge_path, .. } => Some(bridge_path.clone()),
-                LaunchMode::Plain => None,
-            },
-        }),
+        Ok(mut child) => {
+            // Pump stdout/stderr into the in-memory ring buffer. Detached
+            // threads: they hold only the OutputLog Arc (never the Child),
+            // and exit at EOF — i.e. when the app (and any forked children
+            // keeping the pipe open, such as the ns relay) are gone.
+            if let Some(out) = child.stdout.take() {
+                pipe_to_log(out, out_log.clone());
+            }
+            if let Some(err) = child.stderr.take() {
+                pipe_to_log(err, out_log);
+            }
+            Ok(RunningApp {
+                app_id: app.id.clone(),
+                pid: child.id(),
+                sandboxed: matches!(mode, LaunchMode::Sandboxed { .. }),
+                child: Some(child),
+                bridge_path: match mode {
+                    LaunchMode::Sandboxed { bridge_path, .. } => Some(bridge_path.clone()),
+                    LaunchMode::Plain => None,
+                },
+            })
+        }
         Err(e) => Err(LaunchError::Spawn(e)),
     }
+}
+
+/// Read `r` to EOF in 8 KiB chunks, appending everything to `log`.
+fn pipe_to_log<R: Read + Send + 'static>(mut r: R, log: Arc<OutputLog>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => log.append(&buf[..n]),
+            }
+        }
+    });
 }
 
 /// Spawn a watcher thread that polls the process and calls `on_exit`
@@ -337,7 +373,8 @@ mod tests {
     fn plain_launch_true_binary() {
         let app = AppEntry::new("t.desktop".into(), "t".into(), "i".into(), "/bin/true".into());
         let mode = prepare_launch(&app).unwrap();
-        let mut running = spawn_app(&app, &mode).unwrap();
+        let logs = OutputLogRegistry::default();
+        let mut running = spawn_app(&app, &mode, &logs).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(!running.is_alive());
     }
@@ -384,5 +421,64 @@ mod tests {
             LaunchMode::Plain => {}
             other => panic!("expected plain mode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plain_launch_captures_output() {
+        // A script file avoids shell quoting inside Exec: the launcher runs
+        // each whitespace-separated word as its own argv entry.
+        let dir = std::env::temp_dir().join(format!("jail-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("cap.sh");
+        std::fs::write(&script, "#!/bin/sh\necho out-line\necho err-line >&2\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let app = AppEntry::new(
+            "t.desktop".into(),
+            "t".into(),
+            "i".into(),
+            script.to_string_lossy().into_owned(),
+        );
+        let mode = prepare_launch(&app).unwrap();
+        let logs = OutputLogRegistry::default();
+        let mut running = spawn_app(&app, &mode, &logs).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // give the pump threads a moment to drain the pipes
+        std::thread::sleep(Duration::from_millis(300));
+        let log = logs.get(&app.id).expect("output log registered");
+        let (buf, _) = log.snapshot();
+        assert!(buf.contains("out-line"), "stdout captured: {buf:?}");
+        assert!(buf.contains("err-line"), "stderr captured: {buf:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relaunch_resets_output_log() {
+        let app = AppEntry::new("t.desktop".into(), "t".into(), "i".into(), "/bin/true".into());
+        let mode = prepare_launch(&app).unwrap();
+        let logs = OutputLogRegistry::default();
+        let mut first = spawn_app(&app, &mode, &logs).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while first.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let log = logs.get(&app.id).expect("log after first run");
+        let (buf, total) = log.snapshot();
+        assert_eq!((buf.is_empty(), total), (true, 0), "/bin/true is silent");
+
+        // second launch: same registry, fresh buffer
+        let mut second = spawn_app(&app, &mode, &logs).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while second.is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let log2 = logs.get(&app.id).expect("log after second run");
+        let (buf2, total2) = log2.snapshot();
+        assert_eq!((buf2.is_empty(), total2), (true, 0), "reset each launch");
+        assert!(!Arc::ptr_eq(&log, &log2), "new OutputLog per launch");
     }
 }
