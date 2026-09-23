@@ -1,6 +1,6 @@
 # App Launcher
 
-Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格），支持按应用限制网络访问（域名 / IP 白名单）。
+Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格），支持按应用限制网络访问（域名 / IP 黑白名单）。
 
 ![tech](https://img.shields.io/badge/Rust-GTK4%20%2B%20libadwaita-orange)
 
@@ -14,21 +14,26 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格），支持按
   - 单击应用 = 直接启动（无确认）
   - 右键 / 长按 = 菜单：启动、设置沙盒…、访问日志…、运行日志…、删除…
   - 删除需弹窗确认（仅移除启动器条目，不卸载应用）
-  - 访问日志（AdwDialog）：按主机汇总放行/拒绝/DNS 与流量，附原始 JSONL 视图
+  - 访问日志（AdwDialog）：按主机汇总放行/拒绝/DNS 与流量（字典序排列），附原始 JSONL 视图；
+    汇总行右键菜单：复制主机文本、允许访问（白名单）/ 禁止访问（黑名单）——修改即时生效
   - 运行日志（AdwDialog）：实时查看应用 stdout/stderr，内存环形缓冲上限 1 MB，
     自动丢弃最早输出，**不写入磁盘**；应用退出后仍可查看，下次启动时重置
-  - 沙盒设置为应用内模态窗（AdwDialog）：启用开关、允许的域名、允许的 IP/网段、
-    回环/DNS 开关、域名解析预览
+  - 沙盒设置为应用内模态窗（AdwDialog）：启用开关、黑名单模式开关、规则条目、
+    回环/DNS 开关
 - **网络沙盒**（每个应用独立配置）：
   - 应用运行在独立 user+network+mount 命名空间中（无需 root），且以**当前用户身份（非 root）**
     运行 —— 命名空间内不持有任何 capability，Electron 应用可正常运行
   - 命名空间内 nftables 策略为 `policy drop`，仅放行 loopback —— 直连一律失败（fail closed）
   - 唯一出口是代理链路：应用 → 127.0.0.1:8080（HTTP CONNECT）→ 命名空间内 relay
-    → AF_UNIX 桥 → 宿主侧 bridge（执行域名/IP/CIDR 白名单校验）→ 互联网
+    → AF_UNIX 桥 → 宿主侧 bridge（执行域名/IP/CIDR 黑白名单校验）→ 互联网
   - DNS：`/etc/resolv.conf` 绑定挂载为 `nameserver 127.0.0.1`，由 relay 经桥转发到宿主解析器
     （宿主侧解析，兼容 VPN / 内网 DNS）
-  - 白名单匹配规则：域名精确匹配（`example.com`）、`*.example.com` 通配一级子域名、
+  - **黑白名单**：白名单（默认，列表内放行/其余拒绝）或黑名单（列表内拒绝/其余放行）；
+    匹配规则：域名精确匹配（`example.com`）、`*.example.com` 通配一级子域名、
     精确 IP、CIDR 网段
+  - **规则动态生效**：规则持久化在 `~/.config/jail/allow/<app_id>.json`，bridge 监视文件
+    变化（≤2 秒轮询），设置保存或日志页允许/禁止操作后**立即生效**，无需重启应用；
+    回环开关变更需重启应用（nft 层）
   - AppImage 应用自动以 extract-and-run 模式启动（命名空间内 FUSE 不可用）
 
 ## 构建
@@ -83,11 +88,11 @@ src/
 
 ## 测试
 
-`./build.sh test` 包含 45 个测试：
+`./build.sh test` 包含 50 个测试：
 
 - 单元测试：字段码剥离、store 读写/损坏恢复、IP/CIDR 解析、nft 批处理构建、
-  白名单匹配（域名精确/通配 / CIDR / loopback）、输出环形缓冲（轮转 / 硬截 / registry）、
-  真实进程 spawn（含 stdout/stderr 捕获与重置）、Exec 双引号剥离
+  黑白名单判定（精确/通配域名、IP、CIDR、回环、双模式）、输出环形缓冲（轮转 / 硬截 / registry）、
+  真实进程 spawn（含 stdout/stderr 捕获与重置）、Exec 双引号剥离、规则文件写入
 - 端到端（`tests/e2e.rs`）：通过真实 `spawn_app` 路径启动沙盒内"假应用"，
   验证白名单域名可达（HTTP 200）、非白名单域名被拒、应用以非 root uid 运行、
   请求日志与输出捕获

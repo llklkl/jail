@@ -23,6 +23,10 @@ pub struct RunningApp {
     child: Option<Child>,
     /// host bridge socket path (sandboxed only); removed on exit
     pub bridge_path: Option<String>,
+    /// rules file consumed by the bridge (sandboxed only); persists after
+    /// exit — the UI rewrites it to make rule edits take effect dynamically
+    #[allow(dead_code)] // read by the UI via RunningRegistry::get
+    pub allow_path: Option<PathBuf>,
 }
 
 impl RunningApp {
@@ -53,6 +57,12 @@ impl RunningRegistry {
         self.inner.lock().unwrap().remove(app_id);
     }
 
+    /// The running handle for an app, if any.
+    #[allow(dead_code)] // used by the UI for dynamic rule updates
+    pub fn get(&self, app_id: &str) -> Option<Arc<Mutex<RunningApp>>> {
+        self.inner.lock().unwrap().get(app_id).cloned()
+    }
+
     pub fn is_running(&self, app_id: &str) -> bool {
         self.inner
             .lock()
@@ -70,7 +80,9 @@ pub enum LaunchMode {
     /// Run inside user+net+mount namespaces via the `--ns-child` helper.
     /// The app runs as the invoking user (non-root) inside the namespace.
     Sandboxed {
-        allow: AllowList,
+        /// JSON rules file consumed by the bridge + ns-child; the bridge
+        /// re-reads it when the UI rewrites it (dynamic rule updates).
+        allow_path: PathBuf,
         bridge_path: String,
         /// JSONL request log for this app (host side).
         log_path: PathBuf,
@@ -92,14 +104,24 @@ impl std::fmt::Display for LaunchError {
     }
 }
 
-/// Resolve the sandbox config into a launch mode. The allowlist is enforced
-/// by the host bridge on hostnames (no pre-launch DNS resolution needed);
-/// `config_base` selects where the per-app request logs live.
-pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Result<LaunchMode, LaunchError> {
-    if !app.sandbox.enabled {
-        return Ok(LaunchMode::Plain);
-    }
+/// The launcher's config directory (`~/.config/jail`): apps.json, per-app
+/// request logs and per-app allowlist files live here.
+pub fn config_base() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("jail")
+}
+
+/// Serialize the app's sandbox rules into the allowlist file consumed by the
+/// host bridge (`config_base/allow/<app_id>.json`). Called on every launch
+/// and whenever the UI changes the rules — the running bridge picks up the
+/// new file within its poll interval, making edits take effect immediately.
+/// Returns the file path.
+pub fn write_allow_file(config_base: &std::path::Path, app: &AppEntry) -> PathBuf {
+    let dir = config_base.join("allow");
+    let _ = std::fs::create_dir_all(&dir);
     let allow = AllowList {
+        mode: app.sandbox.allow_mode,
         entries: app
             .sandbox
             .allow_entries
@@ -109,6 +131,22 @@ pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Resul
             .collect(),
         loopback: app.sandbox.allow_loopback,
     };
+    let path = dir.join(format!("{}.json", app.id));
+    if let Ok(json) = serde_json::to_string(&allow) {
+        let _ = std::fs::write(&path, json);
+    }
+    path
+}
+
+/// Resolve the sandbox config into a launch mode. The allowlist is enforced
+/// by the host bridge on hostnames (no pre-launch DNS resolution needed);
+/// `config_base` selects where the per-app request logs and allowlist files
+/// live.
+pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Result<LaunchMode, LaunchError> {
+    if !app.sandbox.enabled {
+        return Ok(LaunchMode::Plain);
+    }
+    let allow_path = write_allow_file(config_base, app);
     let logs_dir = config_base.join("logs");
     std::fs::create_dir_all(&logs_dir).map_err(|e| LaunchError::Sandbox(e.to_string()))?;
     let bridge_path = std::env::temp_dir().join(format!(
@@ -118,7 +156,7 @@ pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Resul
     ));
     let _ = std::fs::remove_file(&bridge_path);
     Ok(LaunchMode::Sandboxed {
-        allow,
+        allow_path,
         bridge_path: bridge_path.to_string_lossy().into_owned(),
         log_path: logs_dir.join(format!("{}.jsonl", app.id)),
     })
@@ -126,10 +164,7 @@ pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Resul
 
 /// Default entry point using the real config directory.
 pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
-    let base = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("jail");
-    prepare_launch_in(&base, app)
+    prepare_launch_in(&config_base(), app)
 }
 
 /// Strip one pair of spec-level double quotes from an Exec word (argument
@@ -219,16 +254,13 @@ pub fn spawn_app(
             c
         }
         LaunchMode::Sandboxed {
-            allow,
+            allow_path,
             bridge_path,
             log_path,
         } => {
-            // 1. start the host bridge (validates the allowlist, writes the
-            //    request log)
-            let allow_json = serde_json::to_string(allow)
-                .map_err(|e| LaunchError::Sandbox(e.to_string()))?;
-            let allow_file =
-                write_temp_file("jail-allow", &allow_json).map_err(LaunchError::Spawn)?;
+            // 1. start the host bridge (reads the rules file, enforces it,
+            //    writes the request log; re-reads the file on change)
+            let allow_file = allow_path.to_string_lossy().into_owned();
             let bridge = Command::new(&self_exe)
                 .args([
                     "--bridge",
@@ -290,6 +322,10 @@ pub fn spawn_app(
                 child: Some(child),
                 bridge_path: match mode {
                     LaunchMode::Sandboxed { bridge_path, .. } => Some(bridge_path.clone()),
+                    LaunchMode::Plain => None,
+                },
+                allow_path: match mode {
+                    LaunchMode::Sandboxed { allow_path, .. } => Some(allow_path.clone()),
                     LaunchMode::Plain => None,
                 },
             })
@@ -405,10 +441,41 @@ mod tests {
         app.sandbox.allow_entries = vec!["example.com".into()];
         let mode = prepare_launch_in(&dir, &app).unwrap();
         assert!(matches!(mode, LaunchMode::Sandboxed { .. }));
-        if let LaunchMode::Sandboxed { allow, .. } = mode {
-            assert_eq!(allow.entries, vec!["example.com"]);
-            assert!(allow.loopback);
+        if let LaunchMode::Sandboxed { allow_path, .. } = mode {
+            // the rules file must exist and carry the sandbox config
+            let text = std::fs::read_to_string(&allow_path).unwrap();
+            let list: AllowList = serde_json::from_str(&text).unwrap();
+            assert_eq!(list.entries, vec!["example.com"]);
+            assert!(list.loopback);
+            assert_eq!(list.mode, crate::model::AllowMode::Whitelist);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_allow_file_reflects_mode_and_edits() {
+        let dir = std::env::temp_dir().join(format!("jail-af-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app =
+            AppEntry::new("t.desktop".into(), "t".into(), "i".into(), "/bin/true".into());
+        app.sandbox.enabled = true;
+        app.sandbox.allow_entries = vec!["a.com".into()];
+        let path = write_allow_file(&dir, &app);
+        assert!(path.starts_with(dir.join("allow")));
+        let list: AllowList =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(list.entries, vec!["a.com"]);
+        assert_eq!(list.mode, crate::model::AllowMode::Whitelist);
+
+        // UI edits: switch to blacklist + new entries → rewrite reflects it
+        app.sandbox.allow_mode = crate::model::AllowMode::Blacklist;
+        app.sandbox.allow_entries = vec!["evil.com".into()];
+        let path2 = write_allow_file(&dir, &app);
+        assert_eq!(path, path2, "deterministic path per app");
+        let list: AllowList =
+            serde_json::from_str(&std::fs::read_to_string(&path2).unwrap()).unwrap();
+        assert_eq!(list.mode, crate::model::AllowMode::Blacklist);
+        assert_eq!(list.entries, vec!["evil.com"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

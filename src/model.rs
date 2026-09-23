@@ -64,6 +64,28 @@ pub fn classify_entry(raw: &str) -> Option<EntryKind> {
     }
 }
 
+/// How the entry list is interpreted by the proxy bridge.
+///
+/// - `Whitelist` (default): entries are allowed, everything else is denied.
+/// - `Blacklist`: entries are denied, everything else is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AllowMode {
+    #[default]
+    Whitelist,
+    Blacklist,
+}
+
+impl AllowMode {
+    #[allow(dead_code)] // reserved for mode-aware UI labels
+    pub fn title(self) -> &'static str {
+        match self {
+            AllowMode::Whitelist => "白名单",
+            AllowMode::Blacklist => "黑名单",
+        }
+    }
+}
+
 /// Raw shape of the persisted config, used to migrate the legacy
 /// `allow_domains` + `allow_ips` fields into the unified `allow_entries`.
 #[derive(Deserialize, Default)]
@@ -76,6 +98,8 @@ struct RawConfig {
     allow_entries: Vec<String>,
     #[serde(default)]
     allow_loopback: Option<bool>,
+    #[serde(default)]
+    allow_mode: Option<AllowMode>,
     #[serde(default)]
     enabled: bool,
 }
@@ -99,6 +123,7 @@ impl From<RawConfig> for SandboxConfig {
             enabled: raw.enabled,
             allow_entries: entries,
             allow_loopback: raw.allow_loopback.unwrap_or(true),
+            allow_mode: raw.allow_mode.unwrap_or_default(),
         }
     }
 }
@@ -116,6 +141,9 @@ pub struct SandboxConfig {
     /// Allow loopback + DNS to the system resolver (default true).
     #[serde(default)]
     pub allow_loopback: bool,
+    /// How `allow_entries` is interpreted (default: whitelist).
+    #[serde(default)]
+    pub allow_mode: AllowMode,
 }
 
 impl SandboxConfig {}
@@ -126,6 +154,7 @@ impl Default for SandboxConfig {
             enabled: false,
             allow_entries: Vec::new(),
             allow_loopback: true,
+            allow_mode: AllowMode::default(),
         }
     }
 }
@@ -226,6 +255,25 @@ mod tests {
         assert!(!cfg.enabled);
         assert!(cfg.allow_loopback);
         assert!(cfg.allow_entries.is_empty());
+        assert_eq!(cfg.allow_mode, AllowMode::Whitelist);
+    }
+
+    #[test]
+    fn allow_mode_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&AllowMode::Whitelist).unwrap(),
+            "\"whitelist\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AllowMode::Blacklist).unwrap(),
+            "\"blacklist\""
+        );
+        let cfg: SandboxConfig =
+            serde_json::from_str(r#"{"enabled":true,"allow_mode":"blacklist"}"#).unwrap();
+        assert_eq!(cfg.allow_mode, AllowMode::Blacklist);
+        // missing field → whitelist (backward compatible with old configs)
+        let cfg: SandboxConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(cfg.allow_mode, AllowMode::Whitelist);
     }
 
     #[test]
@@ -291,6 +339,7 @@ mod tests {
             enabled: true,
             allow_entries: vec!["x.com".into()],
             allow_loopback: false,
+            allow_mode: AllowMode::Whitelist,
         };
         let text = serde_json::to_string(&cfg).unwrap();
         assert!(!text.contains("allow_domains"));

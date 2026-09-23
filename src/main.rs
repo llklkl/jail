@@ -14,11 +14,11 @@ fn main() {
     // Headless subcommands for the sandbox plumbing.
     if args.len() >= 4 && args[1] == "--bridge" {
         let socket_path = args[2].clone();
-        let allow_json = std::fs::read_to_string(&args[3]).expect("read allowlist file");
-        let allow: proxy::AllowList = serde_json::from_str(&allow_json).expect("parse allowlist");
+        // rules file: read at startup, re-read when the UI rewrites it
+        let allow_path = args[3].clone();
         // optional 4th arg: JSONL request log path
         let log_path = args.get(4).cloned();
-        if let Err(e) = proxy::run_host_bridge(&socket_path, allow, log_path) {
+        if let Err(e) = proxy::run_host_bridge(&socket_path, std::path::Path::new(&allow_path), log_path) {
             eprintln!("jail bridge: {e}");
             std::process::exit(1);
         }

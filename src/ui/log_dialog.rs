@@ -2,10 +2,12 @@
 //!
 //! The log file is written by the host bridge process; this dialog tails it
 //! incrementally (byte offset + partial-line buffer) and refreshes the
-//! summary every second while open.
+//! summary every second while open. Each summary row has a context menu:
+//! copy the host text, and (mode-dependent) allow/deny it — the action
+//! rewrites the app's rules file so a running bridge picks it up.
 
 use super::log_data::{human_bytes, summarize, tail_lines};
-use crate::model::AppEntry;
+use crate::model::{AllowMode, AppEntry};
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::Cell;
@@ -15,7 +17,17 @@ use std::rc::Rc;
 const MAX_SUMMARY_ROWS: usize = 200;
 const RAW_VIEW_LINES: usize = 500;
 
-pub fn present(win: &adw::ApplicationWindow, app: &AppEntry, log_path: PathBuf) {
+pub fn present(
+    win: &adw::ApplicationWindow,
+    state: &Rc<super::AppState>,
+    id: &str,
+    log_path: PathBuf,
+) {
+    let id = id.to_string();
+    let Some(app) = state.apps.borrow().iter().find(|a| a.id == id).cloned() else {
+        return;
+    };
+    let app: AppEntry = app;
     let dialog = adw::Dialog::builder()
         .title(format!("访问日志 — {}", app.name))
         .content_width(760)
@@ -87,6 +99,8 @@ pub fn present(win: &adw::ApplicationWindow, app: &AppEntry, log_path: PathBuf) 
         let summary_list = summary_list.clone();
         let status_label = status_label.clone();
         let raw_view = raw_view.clone();
+        let state = state.clone();
+        let id = id.clone();
         move || {
             let text = tail.read_all();
             let last_ts = summarize(&text, 1)
@@ -98,17 +112,21 @@ pub fn present(win: &adw::ApplicationWindow, app: &AppEntry, log_path: PathBuf) 
                 summary_list.remove(&child);
             }
             let rows = summarize(&text, MAX_SUMMARY_ROWS);
+            let mode = current_mode(&state, &id);
             if rows.is_empty() {
                 status_label.set_text("暂无记录 — 启动应用后，经过沙盒代理的连接和 DNS 查询会显示在这里");
             } else {
                 status_label.set_text(&format!(
-                    "{} 个主机 · 实时更新中 · 最近活动 {}",
+                    "{} · {} 个主机 · 字典序 · 最近活动 {}",
+                    mode.title(),
                     rows.len(),
                     format_ts(last_ts)
                 ));
             }
             for h in &rows {
-                summary_list.append(&summary_row(h));
+                let row = summary_row(h, mode);
+                attach_row_menu(&row, &state, &id, &h.host, mode);
+                summary_list.append(&row);
             }
             // raw view: last N lines
             let raw: String = tail_lines(&text, RAW_VIEW_LINES)
@@ -230,7 +248,7 @@ fn format_ts(ts: u64) -> String {
         .unwrap_or_else(|_| ts.to_string())
 }
 
-fn summary_row(h: &super::log_data::HostSummary) -> gtk::ListBoxRow {
+fn summary_row(h: &super::log_data::HostSummary, mode: AllowMode) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     hbox.set_margin_top(6);
@@ -242,9 +260,23 @@ fn summary_row(h: &super::log_data::HostSummary) -> gtk::ListBoxRow {
     let (chip_label, chip_class, chip_tooltip) = if h.denied > 0 && h.allowed > 0 {
         ("部分放行", "log-chip-mixed", "有放行也有拒绝的连接")
     } else if h.denied > 0 {
-        ("已拒绝", "log-chip-denied", "所有连接都被白名单拒绝")
+        (
+            "已拒绝",
+            "log-chip-denied",
+            match mode {
+                AllowMode::Whitelist => "所有连接都被白名单拒绝",
+                AllowMode::Blacklist => "所有连接都被黑名单拒绝",
+            },
+        )
     } else {
-        ("已放行", "log-chip-allowed", "连接被白名单放行")
+        (
+            "已放行",
+            "log-chip-allowed",
+            match mode {
+                AllowMode::Whitelist => "连接被白名单放行",
+                AllowMode::Blacklist => "连接未被黑名单命中，已放行",
+            },
+        )
     };
     let chip = gtk::Label::new(Some(chip_label));
     chip.set_valign(gtk::Align::Center);
@@ -299,4 +331,143 @@ fn summary_row(h: &super::log_data::HostSummary) -> gtk::ListBoxRow {
 
     row.set_child(Some(&hbox));
     row
+}
+
+/// The app's current rule mode (read live so menu labels follow edits).
+fn current_mode(state: &super::AppState, id: &str) -> AllowMode {
+    state
+        .apps
+        .borrow()
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| a.sandbox.allow_mode)
+        .unwrap_or_default()
+}
+
+/// Attach a right-click / long-press context menu to a summary row:
+/// 复制 (always), plus mode-dependent 允许访问 (whitelist) or 禁止访问
+/// (blacklist). Actions rewrite the app's rules file; a running bridge
+/// picks up the change within its poll interval.
+fn attach_row_menu(
+    row: &gtk::ListBoxRow,
+    state: &Rc<super::AppState>,
+    id: &str,
+    host: &str,
+    mode: AllowMode,
+) {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("context-menu");
+    popover.set_autohide(true);
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("rich-list");
+    list.set_margin_top(6);
+    list.set_margin_bottom(6);
+
+    let add_item = |list: &gtk::ListBox, icon: &str, label: &str| -> gtk::Button {
+        let item_row = gtk::ListBoxRow::new();
+        item_row.set_activatable(false);
+        let btn = gtk::Button::new();
+        btn.set_has_frame(false);
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        hbox.set_margin_start(10);
+        hbox.set_margin_end(10);
+        hbox.set_margin_top(4);
+        hbox.set_margin_bottom(4);
+        let img = gtk::Image::from_icon_name(icon);
+        hbox.append(&img);
+        let lbl = gtk::Label::new(Some(label));
+        lbl.set_halign(gtk::Align::Start);
+        lbl.set_hexpand(true);
+        hbox.append(&lbl);
+        btn.set_child(Some(&hbox));
+        item_row.set_child(Some(&btn));
+        list.append(&item_row);
+        btn
+    };
+
+    // 复制: copy the host text to the clipboard
+    let pop = popover.clone();
+    let host_text = host.to_string();
+    let copy_btn = add_item(&list, "edit-copy-symbolic", "复制");
+    copy_btn.connect_clicked(move |_| {
+        let display = gtk::gdk::Display::default();
+        if let Some(display) = display {
+            display.clipboard().set_text(&host_text);
+        }
+        pop.popdown();
+    });
+
+    // mode-dependent allow/deny action
+    let (action_label, action_icon) = match mode {
+        AllowMode::Whitelist => ("允许访问", "list-add-symbolic"),
+        AllowMode::Blacklist => ("禁止访问", "action-unavailable-symbolic"),
+    };
+    let pop = popover.clone();
+    let state = state.clone();
+    let id = id.to_string();
+    let host_owned = host.to_string();
+    let action_btn = add_item(&list, action_icon, action_label);
+    action_btn.connect_clicked(move |_| {
+        apply_rule_action(&state, &id, &host_owned);
+        pop.popdown();
+    });
+
+    popover.set_child(Some(&list));
+    popover.set_parent(row);
+
+    // right click
+    {
+        let pop = popover.clone();
+        let click = gtk::GestureClick::new();
+        click.set_button(3);
+        click.connect_pressed(move |_, _, x, y| {
+            pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                x as i32 - 2,
+                y as i32 - 2,
+                4,
+                4,
+            )));
+            pop.popup();
+        });
+        row.add_controller(click);
+    }
+    // long press (touch)
+    {
+        let pop = popover.clone();
+        let lp = gtk::GestureLongPress::new();
+        lp.connect_pressed(move |_, x, y| {
+            pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                x as i32 - 2,
+                y as i32 - 2,
+                4,
+                4,
+            )));
+            pop.popup();
+        });
+        row.add_controller(lp);
+    }
+}
+
+/// Add `host` to the app's rule entries (deduped), persist the config and
+/// rewrite the rules file so the change takes effect on running apps.
+fn apply_rule_action(state: &super::AppState, id: &str, host: &str) {
+    let app = {
+        let mut apps = state.apps.borrow_mut();
+        let Some(app) = apps.iter_mut().find(|a| a.id == id) else {
+            return;
+        };
+        let dup = app
+            .sandbox
+            .allow_entries
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(host));
+        if !dup {
+            app.sandbox.allow_entries.push(host.to_string());
+        }
+        app.clone()
+    };
+    let _ = state.store.save(&state.apps.borrow());
+    crate::launcher::write_allow_file(&crate::launcher::config_base(), &app);
 }

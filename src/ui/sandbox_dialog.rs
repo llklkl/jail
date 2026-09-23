@@ -53,18 +53,37 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
     enable_group.add(&enable_switch);
     page.add(&enable_group);
 
-    // --- unified allowlist group -------------------------------------------
+    // --- unified rules group -----------------------------------------------
     let allow_group = adw::PreferencesGroup::new();
-    allow_group.set_title("允许访问的地址");
-    allow_group.set_description(Some(
-        "每行一条：域名精确匹配（example.com）；*.example.com 通配一级子域名；IP 或网段（10.0.0.0/8）。未列出的地址将被拒绝。",
-    ));
+    allow_group.set_title("访问规则");
 
-    // Rows for existing entries. The list lives in a Vec we rebuild on save;
-    // each row's delete button removes it from the UI (and from this Vec via
-    // the row index captured at build time — rows are never reordered).
+    // mode switch: whitelist (default) vs blacklist
+    let mode_switch = adw::SwitchRow::builder()
+        .title("黑名单模式")
+        .subtitle("开启后列表中的地址将被禁止，其余全部放行；关闭则为白名单（仅放行列表中的地址）")
+        .active(app.sandbox.allow_mode == crate::model::AllowMode::Blacklist)
+        .build();
+    allow_group.add(&mode_switch);
+
     let entries_list = std::rc::Rc::new(std::cell::RefCell::new(app.sandbox.allow_entries.clone()));
     let rows_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    let group_ref = allow_group.clone();
+    let update_description = move |blacklist: bool| {
+        group_ref.set_description(Some(if blacklist {
+            "黑名单：列表中的地址被禁止访问，其余全部放行。每行一条：域名精确匹配（example.com）；*.example.com 通配一级子域名；IP 或网段（10.0.0.0/8）。"
+        } else {
+            "白名单：仅列表中的地址允许访问，其余一律拒绝。每行一条：域名精确匹配（example.com）；*.example.com 通配一级子域名；IP 或网段（10.0.0.0/8）。"
+        }));
+    };
+    update_description(mode_switch.is_active());
+    {
+        let switch_ref = mode_switch.clone();
+        let update_description = update_description.clone();
+        mode_switch.connect_active_notify(move |_| {
+            update_description(switch_ref.is_active());
+        });
+    }
 
     let add_entry_row: std::rc::Rc<dyn Fn(String)> = std::rc::Rc::new({
         let rows_box = rows_box.clone();
@@ -170,18 +189,38 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
         let dialog = dialog.clone();
         let enable_switch = enable_switch.clone();
         let entries_list = entries_list.clone();
+        let mode_switch = mode_switch.clone();
         save_btn.connect_clicked(move |_| {
             let enabled = enable_switch.is_active();
             let loopback = loopback_switch.is_active();
             let entries = entries_list.borrow().clone();
+            let mode = if mode_switch.is_active() {
+                crate::model::AllowMode::Blacklist
+            } else {
+                crate::model::AllowMode::Whitelist
+            };
 
-            {
+            let app_id = {
                 let mut apps = state.apps.borrow_mut();
                 let Some(idx) = apps.iter().position(|a| a.id == id) else { return };
                 let app = &mut apps[idx];
                 app.sandbox.enabled = enabled;
                 app.sandbox.allow_entries = entries;
                 app.sandbox.allow_loopback = loopback;
+                app.sandbox.allow_mode = mode;
+                app.id.clone()
+            };
+            // rewrite the rules file so a running bridge picks up the change
+            // within its poll interval (dynamic effect); if the app is not
+            // running, the next launch reads the same file.
+            let app = state
+                .apps
+                .borrow()
+                .iter()
+                .find(|a| a.id == app_id)
+                .cloned();
+            if let Some(app) = app {
+                crate::launcher::write_allow_file(&crate::launcher::config_base(), &app);
             }
             after_mutation(&state, &win);
             dialog.close();

@@ -564,11 +564,9 @@ fn open_log_dialog(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str)
     let Some(app) = state.apps.borrow().iter().find(|a| a.id == id).cloned() else {
         return;
     };
-    let base = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("jail");
+    let base = crate::launcher::config_base();
     let log_path = base.join("logs").join(format!("{}.jsonl", app.id));
-    log_dialog::present(win, &app, log_path);
+    log_dialog::present(win, state, id, log_path);
 }
 
 /// Open the run-output dialog for one app: the in-memory capture of its most

@@ -75,9 +75,13 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 
 /// Allowlist shared with the host bridge. Entries are domains (suffix
 /// match), single IPs, or CIDR ranges — classified on demand via
-/// `model::classify_entry`.
+/// `model::classify_entry`. The list is interpreted according to `mode`:
+/// whitelist (entries allowed, rest denied) or blacklist (entries denied,
+/// rest allowed).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AllowList {
+    #[serde(default)]
+    pub mode: crate::model::AllowMode,
     #[serde(default)]
     pub entries: Vec<String>,
     #[serde(default = "default_true")]
@@ -89,47 +93,67 @@ fn default_true() -> bool {
 }
 
 impl AllowList {
-    /// Check a host (name or IP); returns the matching reason for logging:
-    /// "loopback" | "domain" | "ip" | "cidr".
+    /// Decide whether a host (name or IP) may connect; returns
+    /// `(allowed, reason)`. The reason is recorded in the request log's
+    /// `via` field:
+    /// - allow: "loopback" | "domain" | "ip" | "cidr" | "default-allow"
+    /// - deny:  "loopback-denied" | "blacklisted" | "not-in-whitelist"
     ///
     /// Domain entries match by label: `example.com` matches only itself;
     /// `*.example.com` matches exactly one extra label (api.example.com,
     /// not a.b.example.com, not example.com itself).
-    pub fn match_reason(&self, host: &str) -> Option<&'static str> {
+    pub fn decide(&self, host: &str) -> (bool, &'static str) {
         let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
         if host == "localhost" || host.starts_with("127.") || host == "::1" {
-            return self.loopback.then_some("loopback");
+            return (self.loopback, if self.loopback { "loopback" } else { "loopback-denied" });
         }
-        for e in &self.entries {
+        let matched = self.entries.iter().find_map(|e| {
             match classify_entry(e) {
-                Some(EntryKind::Domain) => {
-                    if domain_entry_matches(e.trim(), &host) {
-                        return Some("domain");
-                    }
-                }
-                Some(EntryKind::Ip) => {
-                    if let Ok(ip) = host.parse::<IpAddr>() {
-                        if e.trim().parse::<IpAddr>() == Ok(ip) {
-                            return Some("ip");
-                        }
-                    }
-                }
-                Some(EntryKind::Cidr { .. }) => {
-                    if let Ok(ip) = host.parse::<IpAddr>() {
-                        if cidr_entry_contains(e, ip) {
-                            return Some("cidr");
-                        }
-                    }
-                }
-                None => {}
+                Some(EntryKind::Domain) => domain_entry_matches(e.trim(), &host)
+                    .then_some("domain"),
+                Some(EntryKind::Ip) => host
+                    .parse::<IpAddr>()
+                    .ok()
+                    .filter(|ip| e.trim().parse::<IpAddr>() == Ok(*ip))
+                    .map(|_| "ip"),
+                Some(EntryKind::Cidr { .. }) => host
+                    .parse::<IpAddr>()
+                    .ok()
+                    .filter(|ip| cidr_entry_contains(e, *ip))
+                    .map(|_| "cidr"),
+                None => None,
             }
+        });
+        match (self.mode, matched) {
+            (crate::model::AllowMode::Whitelist, Some(reason)) => (true, reason),
+            (crate::model::AllowMode::Whitelist, None) => (false, "not-in-whitelist"),
+            (crate::model::AllowMode::Blacklist, Some(reason)) => (false, reason_for_deny(reason)),
+            (crate::model::AllowMode::Blacklist, None) => (true, "default-allow"),
         }
-        None
     }
 
-    #[allow(dead_code)] // convenience wrapper; match_reason is the primary API
+    /// Whitelist-era API: the match reason when the host is allowed.
+    #[allow(dead_code)] // convenience wrapper; decide is the primary API
+    pub fn match_reason(&self, host: &str) -> Option<&'static str> {
+        let (allowed, reason) = self.decide(host);
+        allowed.then_some(reason)
+    }
+
+    #[allow(dead_code)] // convenience wrapper; decide is the primary API
     pub fn matches(&self, host: &str) -> bool {
-        self.match_reason(host).is_some()
+        self.decide(host).0
+    }
+}
+
+/// In blacklist mode the log's `via` field should say why the host was
+/// denied: the entry kind that matched ("domain"/"ip"/"cidr") is ambiguous
+/// with an allow reason, so map it to an explicit deny reason.
+fn reason_for_deny(kind: &'static str) -> &'static str {
+    match kind {
+        "domain" => "blacklisted-domain",
+        "ip" => "blacklisted-ip",
+        "cidr" => "blacklisted-cidr",
+        other => other,
     }
 }
 
@@ -542,10 +566,15 @@ fn pump_bidir_tcp_unix(a: &mut TcpStream, b: &mut UnixStream) {
 ///   host   → frame("OK") | frame("ERR reason")
 ///   then raw bidirectional byte stream (TCP) / framed datagrams (DNS).
 ///
+/// `allow_path`: JSON file with the `AllowList`. Read at startup and
+/// re-loaded automatically when the file's mtime changes (the UI rewrites it
+/// on sandbox edits / log-viewer allow-deny actions), so rule changes take
+/// effect on running apps within the poll interval.
+///
 /// `log_path` (optional): JSONL event log with conn/end/dns events.
 pub fn run_host_bridge(
     socket_path: &str,
-    allow: AllowList,
+    allow_path: &std::path::Path,
     log_path: Option<String>,
 ) -> std::io::Result<()> {
     let listener = UnixListener::bind(socket_path)?;
@@ -555,15 +584,38 @@ pub fn run_host_bridge(
             .unwrap_or_else(EventLogger::disabled),
     );
     let attribution = Arc::new(Attribution::default());
+    let allow = Arc::new(std::sync::RwLock::new(read_allow_file(allow_path)));
 
     // Self-exit: the launcher's watcher deletes the socket file when the app
-    // exits; poll for that so detached bridges don't linger forever.
+    // exits; poll for that so detached bridges don't linger forever. The same
+    // poll reloads the allowlist when the UI rewrites the file.
     {
         let path = PathBuf::from(socket_path);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(2));
-            if !path.exists() {
-                std::process::exit(0);
+        let allow_path = PathBuf::from(allow_path);
+        let allow = allow.clone();
+        std::thread::spawn(move || {
+            let mut mtime = file_mtime(&allow_path);
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                if !path.exists() {
+                    std::process::exit(0);
+                }
+                let m = file_mtime(&allow_path);
+                if m != mtime {
+                    mtime = m;
+                    match std::fs::read_to_string(&allow_path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|s| serde_json::from_str::<AllowList>(&s).map_err(|e| e.to_string()))
+                    {
+                        Ok(list) => {
+                            *allow.write().unwrap() = list;
+                        }
+                        Err(e) => {
+                            // keep serving with the previous rules
+                            eprintln!("jail bridge: allowlist reload failed: {e}");
+                        }
+                    }
+                }
             }
         });
     }
@@ -580,9 +632,23 @@ pub fn run_host_bridge(
     Ok(())
 }
 
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Read + parse the allowlist file; a missing or invalid file yields an
+/// empty whitelist (deny-all for non-loopback) so a broken file never
+/// silently widens access.
+fn read_allow_file(path: &std::path::Path) -> AllowList {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 fn handle_bridge_conn(
     mut stream: UnixStream,
-    allow: AllowList,
+    allow: Arc<std::sync::RwLock<AllowList>>,
     logger: Arc<EventLogger>,
     attribution: Arc<Attribution>,
 ) -> std::io::Result<()> {
@@ -602,25 +668,33 @@ fn handle_bridge_conn(
         return Ok(());
     };
 
-    // Decide: direct allowlist match on the CONNECT host, or — when the app
-    // connected by IP — an attribution learned from its earlier DNS queries.
-    let mut via = allow.match_reason(&host);
+    // Decide: direct rule match on the CONNECT host, or — when the app
+    // connected by IP — a domain learned from its earlier DNS queries
+    // (attribution). The lookup runs in BOTH modes: in blacklist mode a
+    // bare-IP connect must still be denied when it resolves to a listed
+    // domain, otherwise the list could be bypassed by connecting to the IP.
+    let allow = allow.read().unwrap().clone();
+    let mut decision = allow.decide(&host);
     let mut effective_host = host.clone();
-    if via.is_none() {
+    if !decision.0 {
         if let Ok(ip) = host.parse::<IpAddr>() {
             if let Some(domain) = attribution.lookup(&ip) {
-                if let Some(r) = allow.match_reason(&domain) {
-                    via = Some(r);
+                let d = allow.decide(&domain);
+                if d.0 != decision.0 || d.0 {
+                    // attribution changed the outcome (or confirmed allow
+                    // with a better reason): use the domain view
+                    decision = d;
                     effective_host = format!("{host} ({domain})");
                 }
             }
         }
     }
-    let Some(via) = via else {
-        logger.log_conn(&host, port, false, "denied");
-        write_frame(&mut stream, b"ERR denied by allowlist")?;
+    let (allowed, via) = decision;
+    if !allowed {
+        logger.log_conn(&host, port, false, via);
+        write_frame(&mut stream, b"ERR denied by rules")?;
         return Ok(());
-    };
+    }
 
     // resolve + connect on the host side
     let addrs: Vec<SocketAddr> = format!("{host}:{port}")
@@ -918,9 +992,19 @@ fn relay_dns_tcp(mut client: TcpStream, bridge_path: &str) -> std::io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::AllowMode;
 
     fn allow(entries: &[&str], loopback: bool) -> AllowList {
         AllowList {
+            mode: AllowMode::Whitelist,
+            entries: entries.iter().map(|s| s.to_string()).collect(),
+            loopback,
+        }
+    }
+
+    fn deny(entries: &[&str], loopback: bool) -> AllowList {
+        AllowList {
+            mode: AllowMode::Blacklist,
             entries: entries.iter().map(|s| s.to_string()).collect(),
             loopback,
         }
@@ -930,43 +1014,70 @@ mod tests {
     fn allowlist_domains() {
         // exact match: no implicit subdomains anymore
         let a = allow(&["example.com"], true);
+        assert_eq!(a.decide("example.com"), (true, "domain"));
+        assert_eq!(a.decide("api.example.com"), (false, "not-in-whitelist"));
+        assert_eq!(a.decide("a.b.example.com"), (false, "not-in-whitelist"));
+        assert_eq!(a.decide("notexample.com"), (false, "not-in-whitelist"));
+        assert_eq!(a.decide("github.com"), (false, "not-in-whitelist"));
+        assert_eq!(a.decide("localhost"), (true, "loopback"));
+        assert_eq!(a.decide("127.0.0.1"), (true, "loopback"));
+        // match_reason stays the whitelist-era convenience API
         assert_eq!(a.match_reason("example.com"), Some("domain"));
-        assert_eq!(a.match_reason("api.example.com"), None);
-        assert_eq!(a.match_reason("a.b.example.com"), None);
-        assert_eq!(a.match_reason("notexample.com"), None);
         assert_eq!(a.match_reason("github.com"), None);
-        assert_eq!(a.match_reason("localhost"), Some("loopback"));
-        assert_eq!(a.match_reason("127.0.0.1"), Some("loopback"));
     }
 
     #[test]
     fn allowlist_wildcard_domains() {
         // wildcard: exactly one extra label
         let a = allow(&["*.example.com"], false);
-        assert_eq!(a.match_reason("api.example.com"), Some("domain"));
-        assert_eq!(a.match_reason("API.Example.COM"), Some("domain"));
-        assert_eq!(a.match_reason("example.com"), None); // base itself not covered
-        assert_eq!(a.match_reason("a.b.example.com"), None); // two extra labels
-        assert_eq!(a.match_reason("notexample.com"), None);
+        assert_eq!(a.decide("api.example.com"), (true, "domain"));
+        assert_eq!(a.decide("API.Example.COM"), (true, "domain"));
+        assert_eq!(a.decide("example.com"), (false, "not-in-whitelist")); // base itself not covered
+        assert_eq!(a.decide("a.b.example.com"), (false, "not-in-whitelist")); // two extra labels
+        assert_eq!(a.decide("notexample.com"), (false, "not-in-whitelist"));
         // deeper wildcard: one label at that depth
         let b = allow(&["*.api.example.com"], false);
-        assert_eq!(b.match_reason("v1.api.example.com"), Some("domain"));
-        assert_eq!(b.match_reason("api.example.com"), None);
-        assert_eq!(b.match_reason("x.v1.api.example.com"), None);
+        assert_eq!(b.decide("v1.api.example.com"), (true, "domain"));
+        assert_eq!(b.decide("api.example.com"), (false, "not-in-whitelist"));
+        assert_eq!(b.decide("x.v1.api.example.com"), (false, "not-in-whitelist"));
         // case-insensitive entry
         let c = allow(&["*.EXAMPLE.com"], false);
-        assert_eq!(c.match_reason("api.example.com"), Some("domain"));
+        assert_eq!(c.decide("api.example.com"), (true, "domain"));
     }
 
     #[test]
     fn allowlist_ips_and_cidr() {
         let a = allow(&["1.1.1.1", "10.0.0.0/8", "fd00::/8"], false);
-        assert_eq!(a.match_reason("1.1.1.1"), Some("ip"));
-        assert_eq!(a.match_reason("10.20.30.40"), Some("cidr"));
-        assert_eq!(a.match_reason("11.1.1.1"), None);
-        assert_eq!(a.match_reason("192.168.1.1"), None);
-        assert_eq!(a.match_reason("fd12::1"), Some("cidr"));
-        assert_eq!(a.match_reason("localhost"), None);
+        assert_eq!(a.decide("1.1.1.1"), (true, "ip"));
+        assert_eq!(a.decide("10.20.30.40"), (true, "cidr"));
+        assert_eq!(a.decide("11.1.1.1"), (false, "not-in-whitelist"));
+        assert_eq!(a.decide("192.168.1.1"), (false, "not-in-whitelist"));
+        assert_eq!(a.decide("fd12::1"), (true, "cidr"));
+        assert_eq!(a.decide("localhost"), (false, "loopback-denied"));
+    }
+
+    #[test]
+    fn blacklist_domains() {
+        let b = deny(&["tracker.evil.com", "*.ads.example.com"], true);
+        // listed → denied (with the entry kind in the reason)
+        assert_eq!(b.decide("tracker.evil.com"), (false, "blacklisted-domain"));
+        assert_eq!(b.decide("a.ads.example.com"), (false, "blacklisted-domain"));
+        // everything else → allowed
+        assert_eq!(b.decide("www.baidu.com"), (true, "default-allow"));
+        assert_eq!(b.decide("api.example.com"), (true, "default-allow"));
+        // loopback switch still applies independently of the mode
+        assert_eq!(b.decide("localhost"), (true, "loopback"));
+        let b2 = deny(&["evil.com"], false);
+        assert_eq!(b2.decide("localhost"), (false, "loopback-denied"));
+    }
+
+    #[test]
+    fn blacklist_ips_and_cidr() {
+        let b = deny(&["10.0.0.0/8", "1.1.1.1"], false);
+        assert_eq!(b.decide("10.1.2.3"), (false, "blacklisted-cidr"));
+        assert_eq!(b.decide("1.1.1.1"), (false, "blacklisted-ip"));
+        assert_eq!(b.decide("8.8.8.8"), (true, "default-allow"));
+        assert_eq!(b.decide("example.com"), (true, "default-allow"));
     }
 
     #[test]

@@ -104,12 +104,9 @@ pub fn summarize(text: &str, max_hosts: usize) -> Vec<HostSummary> {
     }
 
     let mut out: Vec<HostSummary> = hosts.into_values().collect();
-    out.sort_by(|a, b| {
-        (b.up + b.down)
-            .cmp(&(a.up + a.down))
-            .then(b.last_ts.cmp(&a.last_ts))
-            .then(a.host.cmp(&b.host))
-    });
+    // lexicographic order by host key (domains and IPs interleave in one
+    // stable, predictable list)
+    out.sort_by(|a, b| a.host.cmp(&b.host));
     out.truncate(max_hosts);
     out
 }
@@ -166,15 +163,17 @@ mod tests {
         assert_eq!(gh.denied, 1);
         assert_eq!(gh.allowed, 0);
         assert_eq!(gh.up + gh.down, 0);
-        // sorted by bytes desc: baidu first
-        assert_eq!(s[0].host, "www.baidu.com");
+        // sorted lexicographically: github.com < www.baidu.com
+        assert_eq!(s[0].host, "github.com");
+        assert_eq!(s[1].host, "www.baidu.com");
     }
 
     #[test]
     fn summarize_cap() {
         let s = summarize(SAMPLE, 1);
         assert_eq!(s.len(), 1);
-        assert_eq!(s[0].host, "www.baidu.com");
+        // first in lexicographic order
+        assert_eq!(s[0].host, "github.com");
     }
 
     #[test]
