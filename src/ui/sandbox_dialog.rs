@@ -6,7 +6,6 @@
 use super::{after_mutation, AppState};
 use crate::model::{classify_entry, EntryKind};
 use adw::prelude::*;
-use gtk::glib;
 use std::rc::Rc;
 
 fn entry_subtitle(e: &str) -> String {
@@ -141,36 +140,6 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
         });
     }
 
-    // --- preview group -----------------------------------------------------
-    let preview_group = adw::PreferencesGroup::new();
-    preview_group.set_title("域名解析预览");
-    let preview_label = gtk::Label::new(Some("点击下方按钮检查域名能否解析（信息性检查，拦截在运行时按主机名进行）"));
-    preview_label.set_halign(gtk::Align::Start);
-    preview_label.set_wrap(true);
-    preview_label.add_css_class("dimmed");
-    preview_group.add(&preview_label);
-    let preview_btn = gtk::Button::with_label("解析域名");
-    preview_btn.add_css_class("flat");
-    preview_group.add(&preview_btn);
-    page.add(&preview_group);
-
-    // --- notes group -------------------------------------------------------
-    let notes_group = adw::PreferencesGroup::new();
-    notes_group.set_title("说明");
-    let notes = gtk::Label::new(Some(
-        "· 沙盒仅限制网络访问（域名/IP 白名单），不隔离文件系统与设备。\n\
-         · 域名规则按主机名匹配，无需预先解析；应用先解析再按 IP 连接时，\n\
-         ·   由 DNS 应答自动归属到域名规则。\n\
-         · 启动器退出后，已启动的应用继续运行，沙盒规则随其网络命名空间保留。\n\
-         · 若系统禁用用户命名空间，沙盒启动会失败并提示。",
-    ));
-    notes.set_halign(gtk::Align::Start);
-    notes.set_wrap(true);
-    notes.add_css_class("dimmed");
-    notes.add_css_class("caption");
-    notes_group.add(&notes);
-    page.add(&notes_group);
-
     // --- save --------------------------------------------------------------
     let save_btn = gtk::Button::with_label("保存");
     save_btn.add_css_class("suggested-action");
@@ -187,48 +156,6 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
     content.append(&save_box);
     toolbar.set_content(Some(&content));
     dialog.set_child(Some(&toolbar));
-
-    // preview button: resolve domains on a worker thread
-    {
-        let entries_list = entries_list.clone();
-        let preview_label = preview_label.clone();
-        preview_btn.connect_clicked(move |_| {
-            let domains: Vec<String> = entries_list
-                .borrow()
-                .iter()
-                .filter(|e| classify_entry(e) == Some(EntryKind::Domain))
-                .cloned()
-                .collect();
-            let label = preview_label.clone();
-            // resolve on a worker thread; hop back with plain data only
-            let (tx, rx) = std::sync::mpsc::channel::<String>();
-            std::thread::spawn(move || {
-                let (ips, failed) = crate::sandbox::resolve_domains(&domains);
-                let text = if domains.is_empty() {
-                    "未填写域名".to_string()
-                } else if ips.is_empty() {
-                    format!("解析失败: {}", failed.join(", "))
-                } else {
-                    let mut t = format!("解析到 {} 个地址:", ips.len());
-                    for ip in &ips {
-                        t.push_str(&format!(" {ip}"));
-                    }
-                    if !failed.is_empty() {
-                        t.push_str(&format!("（失败: {}）", failed.join(", ")));
-                    }
-                    t
-                };
-                tx.send(text).ok();
-            });
-            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-                if let Ok(text) = rx.try_recv() {
-                    label.set_text(&text);
-                    return glib::ControlFlow::Break;
-                }
-                glib::ControlFlow::Continue
-            });
-        });
-    }
 
     // save
     {

@@ -1,4 +1,4 @@
-//! Network sandbox: nftables ruleset generation and domain resolution.
+//! Network sandbox: nftables ruleset generation.
 //!
 //! The app runs inside `unshare -Urn` (user + network namespace, no root
 //! needed). Inside that namespace we are root, so nftables rules apply
@@ -7,7 +7,7 @@
 //! `proxy.rs`), which the host bridge filters against the allowlist.
 
 use crate::model::SandboxConfig;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 
 /// A validated IP or CIDR segment.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,37 +41,6 @@ pub fn parse_ips(inputs: &[String]) -> Vec<NetTarget> {
         }
     }
     out
-}
-
-/// Resolve domain names to IPs. Returns (resolved, failed).
-/// Resolution uses the host resolver (works for VPN / private DNS before
-/// the namespace is created).
-pub fn resolve_domains(domains: &[String]) -> (Vec<IpAddr>, Vec<String>) {
-    let mut ips = Vec::new();
-    let mut failed = Vec::new();
-    for d in domains {
-        let d = d.trim();
-        if d.is_empty() {
-            continue;
-        }
-        // ToSocketAddrs needs host:port; use 443 as a dummy port.
-        match format!("{d}:443").to_socket_addrs() {
-            Ok(addrs) => {
-                let mut any = false;
-                for a in addrs {
-                    if !ips.contains(&a.ip()) {
-                        ips.push(a.ip());
-                    }
-                    any = true;
-                }
-                if !any {
-                    failed.push(d.to_string());
-                }
-            }
-            Err(_) => failed.push(d.to_string()),
-        }
-    }
-    (ips, failed)
 }
 
 /// Build the complete nftables script for the sandbox.
