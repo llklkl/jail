@@ -132,6 +132,16 @@ pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
     prepare_launch_in(&base, app)
 }
 
+/// Strip one pair of spec-level double quotes from an Exec word (argument
+/// delimiters per the freedesktop spec, not part of the argument). Shared by
+/// `shell_quote_words` and the AppImage detection in `ns_child`.
+pub(crate) fn strip_exec_quotes(word: &str) -> &str {
+    word.strip_prefix('"')
+        .and_then(|w| w.strip_suffix('"'))
+        .filter(|w| !w.is_empty())
+        .unwrap_or(word)
+}
+
 /// Quote each word of an Exec value for use inside `sh -c`.
 ///
 /// Per the freedesktop Exec spec, double quotes are argument delimiters, not
@@ -142,14 +152,7 @@ pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
 /// still split by whitespace: a pre-existing limitation, unchanged.)
 pub(crate) fn shell_quote_words(exec: &str) -> String {
     exec.split_whitespace()
-        .map(|w| {
-            let unquoted = w
-                .strip_prefix('"')
-                .and_then(|w| w.strip_suffix('"'))
-                .filter(|w| !w.is_empty())
-                .unwrap_or(w);
-            format!("'{}'", unquoted.replace('\'', "'\\''"))
-        })
+        .map(|w| format!("'{}'", strip_exec_quotes(w).replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -366,6 +369,20 @@ mod tests {
         // a bare pair of quotes with nothing inside is not a valid argument:
         // keep it literal rather than producing an empty word
         assert_eq!(shell_quote_words("\"\""), "'\"\"'");
+    }
+
+    #[test]
+    fn strip_exec_quotes_variants() {
+        assert_eq!(
+            strip_exec_quotes("\"/opt/zcode.appimage\""),
+            "/opt/zcode.appimage"
+        );
+        assert_eq!(strip_exec_quotes("/usr/bin/code"), "/usr/bin/code");
+        // unbalanced or inner quotes are kept
+        assert_eq!(strip_exec_quotes("\"unbalanced"), "\"unbalanced");
+        assert_eq!(strip_exec_quotes("say\"hi\""), "say\"hi\"");
+        // a bare pair of quotes is not a valid argument: keep literal
+        assert_eq!(strip_exec_quotes("\"\""), "\"\"");
     }
 
     #[test]

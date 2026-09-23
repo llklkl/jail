@@ -116,8 +116,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // AppImages need FUSE (fusermount is setuid-root; the host root uid is
     // unmapped in this namespace, so the setuid bit is ignored and the mount
     // always fails). AppImageKit's official container mode extracts to /tmp
-    // instead — enable it automatically for .appimage executables.
-    if exec[0].ends_with(".appimage") {
+    // instead — enable it automatically for .appimage executables. The stored
+    // Exec may keep its spec-level double quotes (stripped later at quoting
+    // time), so detect on the unquoted word.
+    if crate::launcher::strip_exec_quotes(&exec[0]).ends_with(".appimage") {
         std::env::set_var("APPIMAGE_EXTRACT_AND_RUN", "1");
     }
     let quoted = crate::launcher::shell_quote_words(&exec.join(" "));
