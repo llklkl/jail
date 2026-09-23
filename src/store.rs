@@ -9,11 +9,36 @@ pub struct Store {
     path: PathBuf,
 }
 
+/// One-time migration: the app was renamed from `app-launcher` to `jail`.
+/// Move the legacy `~/.config/app-launcher/apps.json` into the new directory
+/// if the new one doesn't exist yet.
+fn migrate_legacy_config(new_base: &Path) {
+    let legacy_apps = new_base
+        .parent()
+        .map(|p| p.join("app-launcher/apps.json"))
+        .unwrap_or_else(|| PathBuf::from("app-launcher/apps.json"));
+    if !legacy_apps.is_file() {
+        return;
+    }
+    let new_apps = new_base.join("apps.json");
+    if new_apps.exists() {
+        return;
+    }
+    if fs::create_dir_all(new_base).is_ok() && fs::rename(&legacy_apps, &new_apps).is_ok() {
+        eprintln!("jail: migrated config from {} to {}", legacy_apps.display(), new_apps.display());
+        // remove the now-empty legacy dir if possible
+        if let Some(dir) = legacy_apps.parent() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
 impl Store {
     pub fn new() -> Self {
         let base = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("jail");
+        migrate_legacy_config(&base);
         Self { path: base.join("apps.json") }
     }
 
@@ -111,6 +136,46 @@ mod tests {
         let store = Store::with_path(dir.join("nested/deeper/apps.json"));
         store.save(&[entry("x")]).unwrap();
         assert!(dir.join("nested/deeper/apps.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_config() {
+        let dir = std::env::temp_dir().join(format!("jail-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // legacy layout: <dir>/app-launcher/apps.json
+        let legacy_dir = dir.join("app-launcher");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("apps.json"), "[]").unwrap();
+
+        migrate_legacy_config(&dir.join("jail"));
+
+        assert!(dir.join("jail/apps.json").is_file());
+        assert!(!legacy_dir.exists(), "legacy dir removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_migration_when_new_exists() {
+        let dir = std::env::temp_dir().join(format!("jail-mig2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let legacy_dir = dir.join("app-launcher");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("apps.json"), r#"[{"legacy":true}]"#).unwrap();
+        let new_dir = dir.join("jail");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("apps.json"), "[]").unwrap();
+
+        migrate_legacy_config(&new_dir);
+
+        // new file untouched, legacy kept
+        assert_eq!(std::fs::read_to_string(new_dir.join("apps.json")).unwrap(), "[]");
+        assert!(legacy_dir.join("apps.json").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
