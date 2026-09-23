@@ -78,8 +78,9 @@ pub fn resolve_domains(domains: &[String]) -> (Vec<IpAddr>, Vec<String>) {
 ///
 /// Inside the namespace only loopback traffic is allowed (the proxy relay
 /// lives on 127.0.0.1); everything else is dropped. The allowlist itself is
-/// enforced by the host-side bridge, which sees real hostnames.
-pub fn build_nft_script(cfg: &SandboxConfig, _resolved: &[IpAddr]) -> String {
+/// enforced by the host-side bridge, which sees real hostnames — no
+/// pre-launch DNS resolution is involved.
+pub fn build_nft_script(cfg: &SandboxConfig) -> String {
     let mut lines = String::from(
         "add table inet jail\n\
          add chain inet jail output { type filter hook output priority 0; policy drop; }\n",
@@ -118,11 +119,10 @@ mod tests {
     fn nft_script_loopback_only() {
         let cfg = SandboxConfig {
             enabled: true,
-            allow_domains: vec![],
-            allow_ips: vec!["10.0.0.1".into(), "192.168.0.0/16".into()],
+            allow_entries: vec!["10.0.0.1".into(), "192.168.0.0/16".into()],
             allow_loopback: true,
         };
-        let script = build_nft_script(&cfg, &["1.2.3.4".parse().unwrap()]);
+        let script = build_nft_script(&cfg);
         assert!(script.contains("add table inet jail"));
         assert!(script.contains("policy drop"));
         assert!(script.contains("oifname \"lo\" accept"));
@@ -138,7 +138,7 @@ mod tests {
             allow_loopback: false,
             ..Default::default()
         };
-        let script = build_nft_script(&cfg, &[]);
+        let script = build_nft_script(&cfg);
         assert!(!script.contains("oifname"));
     }
 

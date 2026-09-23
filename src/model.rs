@@ -1,34 +1,117 @@
 //! Data models for launcher entries and sandbox configuration.
 
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+
+/// A sandbox allowlist entry: a domain (suffix match) or an IP / CIDR.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntryKind {
+    /// domain name, suffix match ("example.com" matches api.example.com)
+    Domain,
+    /// single IP address
+    Ip,
+    /// network in CIDR notation (net, prefix length)
+    Cidr { plen: u8 },
+}
+
+/// Classify one user-provided allowlist entry. Returns None when invalid.
+/// This is the single source of truth for entry syntax, shared by the UI
+/// (validation) and the host bridge (matching).
+pub fn classify_entry(raw: &str) -> Option<EntryKind> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some((net, plen)) = s.split_once('/') {
+        let ip = net.parse::<IpAddr>().ok()?;
+        let p: u8 = plen.parse().ok()?;
+        let max = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if p > max {
+            return None;
+        }
+        Some(EntryKind::Cidr { plen: p })
+    } else if s.parse::<IpAddr>().is_ok() {
+        Some(EntryKind::Ip)
+    } else {
+        // A domain: letters/digits/hyphen labels separated by dots. We keep
+        // this permissive (no punycode validation) but reject whitespace,
+        // slashes, ports and other obvious garbage.
+        if s.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '/' | '\\' | ':' | '@' | '?' | '#' | '%' | ',')
+        }) {
+            return None;
+        }
+        if s.split('.').any(|label| label.is_empty()) {
+            return None;
+        }
+        Some(EntryKind::Domain)
+    }
+}
+
+/// Raw shape of the persisted config, used to migrate the legacy
+/// `allow_domains` + `allow_ips` fields into the unified `allow_entries`.
+#[derive(Deserialize, Default)]
+struct RawConfig {
+    #[serde(default)]
+    allow_domains: Vec<String>,
+    #[serde(default)]
+    allow_ips: Vec<String>,
+    #[serde(default)]
+    allow_entries: Vec<String>,
+    #[serde(default)]
+    allow_loopback: Option<bool>,
+    #[serde(default)]
+    enabled: bool,
+}
+
+impl From<RawConfig> for SandboxConfig {
+    fn from(raw: RawConfig) -> Self {
+        // Merge legacy fields first, then append modern entries, deduped.
+        let mut entries: Vec<String> = Vec::new();
+        for e in raw
+            .allow_domains
+            .into_iter()
+            .chain(raw.allow_ips)
+            .chain(raw.allow_entries)
+        {
+            let e = e.trim().to_string();
+            if !e.is_empty() && !entries.iter().any(|x| x.eq_ignore_ascii_case(&e)) {
+                entries.push(e);
+            }
+        }
+        SandboxConfig {
+            enabled: raw.enabled,
+            allow_entries: entries,
+            allow_loopback: raw.allow_loopback.unwrap_or(true),
+        }
+    }
+}
 
 /// Per-application sandbox configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RawConfig")]
 pub struct SandboxConfig {
     /// Whether sandboxing is enabled for this app.
     #[serde(default)]
     pub enabled: bool,
-    /// Domains the app may reach; resolved to IPs at launch time.
+    /// Unified allowlist: domains (suffix match), IPs, CIDR ranges.
     #[serde(default)]
-    pub allow_domains: Vec<String>,
-    /// IPs or CIDR ranges the app may reach directly.
-    #[serde(default)]
-    pub allow_ips: Vec<String>,
+    pub allow_entries: Vec<String>,
     /// Allow loopback + DNS to the system resolver (default true).
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub allow_loopback: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
+impl SandboxConfig {}
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            allow_domains: Vec::new(),
-            allow_ips: Vec::new(),
+            allow_entries: Vec::new(),
             allow_loopback: true,
         }
     }
@@ -129,7 +212,7 @@ mod tests {
         let cfg = SandboxConfig::default();
         assert!(!cfg.enabled);
         assert!(cfg.allow_loopback);
-        assert!(cfg.allow_domains.is_empty());
+        assert!(cfg.allow_entries.is_empty());
     }
 
     #[test]
@@ -145,5 +228,54 @@ mod tests {
         assert_eq!(e, back);
         // sandbox defaults survive roundtrip
         assert!(back.sandbox.allow_loopback);
+    }
+
+    #[test]
+    fn classify_entries() {
+        assert_eq!(classify_entry("example.com"), Some(EntryKind::Domain));
+        assert_eq!(classify_entry(" EXAMPLE.com "), Some(EntryKind::Domain));
+        assert_eq!(classify_entry("10.0.0.1"), Some(EntryKind::Ip));
+        assert_eq!(classify_entry("fe80::1"), Some(EntryKind::Ip));
+        assert_eq!(classify_entry("10.0.0.0/8"), Some(EntryKind::Cidr { plen: 8 }));
+        assert_eq!(
+            classify_entry("fd00::/8"),
+            Some(EntryKind::Cidr { plen: 8 })
+        );
+        assert_eq!(classify_entry(""), None);
+        assert_eq!(classify_entry("not an ip"), None); // space
+        assert_eq!(classify_entry("10.0.0.1/33"), None); // bad v4 prefix
+        assert_eq!(classify_entry("bad..com"), None); // empty label
+        assert_eq!(classify_entry("host:443"), None); // port smuggled in
+        assert_eq!(classify_entry("a/b/c"), None); // slash garbage
+        assert_eq!(classify_entry("10.0.0.1:443"), None); // ip:port
+    }
+
+    #[test]
+    fn legacy_config_migrates() {
+        // old fields only
+        let cfg: SandboxConfig =
+            serde_json::from_str(r#"{"allow_domains":["a.com"],"allow_ips":["10.0.0.0/8"]}"#)
+                .unwrap();
+        assert_eq!(cfg.allow_entries, vec!["a.com", "10.0.0.0/8"]);
+        assert!(cfg.allow_loopback); // default true
+        // mixed old + new, dedup case-insensitively
+        let cfg: SandboxConfig = serde_json::from_str(
+            r#"{"allow_domains":["a.com"],"allow_entries":["A.com","b.org"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.allow_entries, vec!["a.com", "b.org"]);
+        // loopback default when absent
+        let cfg: SandboxConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.allow_loopback);
+        // serialization writes only the new field
+        let cfg = SandboxConfig {
+            enabled: true,
+            allow_entries: vec!["x.com".into()],
+            allow_loopback: false,
+        };
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("allow_domains"));
+        assert!(!text.contains("allow_ips"));
+        assert!(text.contains("allow_entries"));
     }
 }

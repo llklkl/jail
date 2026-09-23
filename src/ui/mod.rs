@@ -1,6 +1,8 @@
 //! UI assembly: main window, app grid, header bar, menus, dialogs.
 
 mod add_dialog;
+mod log_data;
+mod log_dialog;
 mod sandbox_dialog;
 
 use crate::desktop_scan::{self, DesktopApp};
@@ -503,6 +505,17 @@ fn build_context_menu(
         });
     }
     let pop = popover.clone();
+    let log_btn = add_item(&list, "document-open-recent-symbolic", "访问日志…");
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let id = app_id.to_string();
+        log_btn.connect_clicked(move |_| {
+            pop.popdown();
+            open_log_dialog(&win, &state, &id);
+        });
+    }
+    let pop = popover.clone();
     let remove_btn = add_item(&list, "user-trash-symbolic", "删除…");
     {
         let state = state.clone();
@@ -516,6 +529,19 @@ fn build_context_menu(
 
     popover.set_child(Some(&list));
     popover
+}
+
+/// Open the access-log dialog for one app. The log lives in the config dir
+/// next to apps.json; apps without a log file yet get an empty view.
+fn open_log_dialog(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
+    let Some(app) = state.apps.borrow().iter().find(|a| a.id == id).cloned() else {
+        return;
+    };
+    let base = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("jail");
+    let log_path = base.join("logs").join(format!("{}.jsonl", app.id));
+    log_dialog::present(win, &app, log_path);
 }
 
 /// Kick off a launch: DNS resolution happens on a worker thread, then the

@@ -6,6 +6,7 @@ use crate::proxy::AllowList;
 use crate::sandbox;
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt as _;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -70,6 +71,8 @@ pub enum LaunchMode {
         nft_script: String,
         allow: AllowList,
         bridge_path: String,
+        /// JSONL request log for this app (host side).
+        log_path: PathBuf,
     },
 }
 
@@ -88,28 +91,26 @@ impl std::fmt::Display for LaunchError {
     }
 }
 
-/// Resolve the sandbox config into a launch mode. Domains are resolved
-/// host-side at launch (for the preview + early failure detection).
-pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
+/// Resolve the sandbox config into a launch mode. The allowlist is enforced
+/// by the host bridge on hostnames (no pre-launch DNS resolution needed);
+/// `config_base` selects where the per-app request logs live.
+pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Result<LaunchMode, LaunchError> {
     if !app.sandbox.enabled {
         return Ok(LaunchMode::Plain);
     }
-    let (resolved, failed) = sandbox::resolve_domains(&app.sandbox.allow_domains);
-    if !failed.is_empty() {
-        eprintln!("jail: could not resolve domains: {failed:?}");
-    }
-    let nft_script = sandbox::build_nft_script(&app.sandbox, &resolved);
+    let nft_script = sandbox::build_nft_script(&app.sandbox);
     let allow = AllowList {
-        domains: app
+        entries: app
             .sandbox
-            .allow_domains
+            .allow_entries
             .iter()
-            .map(|d| d.trim().to_ascii_lowercase())
+            .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty())
             .collect(),
-        ips: app.sandbox.allow_ips.clone(),
         loopback: app.sandbox.allow_loopback,
     };
+    let logs_dir = config_base.join("logs");
+    std::fs::create_dir_all(&logs_dir).map_err(|e| LaunchError::Sandbox(e.to_string()))?;
     let bridge_path = std::env::temp_dir().join(format!(
         "jail-bridge-{}-{}.sock",
         std::process::id(),
@@ -120,7 +121,16 @@ pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
         nft_script,
         allow,
         bridge_path: bridge_path.to_string_lossy().into_owned(),
+        log_path: logs_dir.join(format!("{}.jsonl", app.id)),
     })
+}
+
+/// Default entry point using the real config directory.
+pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
+    let base = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("jail");
+    prepare_launch_in(&base, app)
 }
 
 /// Quote each word of an Exec value for use inside `sh -c`.
@@ -131,11 +141,39 @@ fn shell_quote_words(exec: &str) -> String {
         .join(" ")
 }
 
-/// Write text to a temp file and return its path.
+/// Write text to a temp file and return its path. The name is unique per
+/// call (pid + sequence) so concurrent launches never clobber each other.
 fn write_temp_file(prefix: &str, content: &str) -> std::io::Result<String> {
-    let path = std::env::temp_dir().join(format!("{prefix}-{}.tmp", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{n}.tmp", std::process::id()));
     std::fs::write(&path, content)?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Prepare an /etc/nsswitch.conf override for the sandbox: rewrite the
+/// `hosts:` line to `files dns` so glibc resolves via our relayed
+/// resolv.conf instead of nss-resolve, which reaches systemd-resolved
+/// through a host AF_UNIX socket and would leak DNS past the sandbox.
+/// Best-effort: returns None when the host has no nsswitch.conf.
+fn write_nsswitch_override() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/nsswitch.conf").ok()?;
+    let mut out = String::with_capacity(text.len());
+    let mut replaced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("hosts:") {
+            out.push_str("hosts:       files dns\n");
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str("hosts:       files dns\n");
+    }
+    write_temp_file("jail-nss", &out).ok()
 }
 
 /// Path of the jail binary used for --bridge / --ns-relay helpers.
@@ -185,36 +223,48 @@ pub fn spawn_app(app: &AppEntry, mode: &LaunchMode) -> Result<RunningApp, Launch
             nft_script,
             allow,
             bridge_path,
+            log_path,
         } => {
-            // 1. start the host bridge (validates the allowlist)
+            // 1. start the host bridge (validates the allowlist, writes the
+            //    request log)
             let allow_json = serde_json::to_string(allow)
                 .map_err(|e| LaunchError::Sandbox(e.to_string()))?;
             let allow_file =
                 write_temp_file("jail-allow", &allow_json).map_err(LaunchError::Spawn)?;
             let bridge = Command::new(&self_exe)
-                .args(["--bridge", bridge_path, &allow_file])
+                .args([
+                    "--bridge",
+                    bridge_path,
+                    &allow_file,
+                    &log_path.to_string_lossy(),
+                ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(LaunchError::Spawn)?;
-            std::mem::forget(bridge); // detached; exits when the socket is gone
+            std::mem::forget(bridge); // detached; self-exits when the socket file is removed
 
             // 2. prepare ns-side files
             let nft_file = write_temp_file("jail-nft", nft_script)
                 .map_err(LaunchError::Spawn)?;
             let resolv_file = write_temp_file("jail-resolv", "nameserver 127.0.0.1\n")
                 .map_err(LaunchError::Spawn)?;
+            let nss_file = write_nsswitch_override();
 
             // 3. inner script
+            let nss_mount = nss_file
+                .as_deref()
+                .map(|p| format!("mount --bind '{p}' /etc/nsswitch.conf && "))
+                .unwrap_or_default();
             let inner = format!(
-                "ip link set lo up                  && nft -f '{nft_file}'                  && mount --bind '{resolv_file}' /etc/resolv.conf                  && '{self_exe}' --ns-relay '{bridge_path}' & \
+                "ip link set lo up                  && nft -f '{nft_file}'                  && mount --bind '{resolv_file}' /etc/resolv.conf                  && {nss_mount}'{self_exe}' --ns-relay '{bridge_path}' & \
                  RELAY=$!; \
                  export HTTP_PROXY=http://127.0.0.1:8080 \
                  HTTPS_PROXY=http://127.0.0.1:8080 \
                  http_proxy=http://127.0.0.1:8080 \
                  https_proxy=http://127.0.0.1:8080 \
-                 ALL_PROXY=socks5://127.0.0.1:8080 \
-                 all_proxy=socks5://127.0.0.1:8080 \
+                 ALL_PROXY=http://127.0.0.1:8080 \
+                 all_proxy=http://127.0.0.1:8080 \
                  NO_PROXY=localhost,127.0.0.1 \
                  no_proxy=localhost,127.0.0.1; \
                  sleep 0.5; \
@@ -294,15 +344,45 @@ mod tests {
 
     #[test]
     fn sandboxed_launch_sandboxed_flag() {
+        let dir = std::env::temp_dir().join(format!("jail-sb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let mut app =
             AppEntry::new("t.desktop".into(), "t".into(), "i".into(), "/bin/true".into());
         app.sandbox.enabled = true;
-        app.sandbox.allow_domains = vec!["example.com".into()];
-        let mode = prepare_launch(&app).unwrap();
+        app.sandbox.allow_entries = vec!["example.com".into()];
+        let mode = prepare_launch_in(&dir, &app).unwrap();
         assert!(matches!(mode, LaunchMode::Sandboxed { .. }));
         if let LaunchMode::Sandboxed { allow, .. } = mode {
-            assert_eq!(allow.domains, vec!["example.com"]);
+            assert_eq!(allow.entries, vec!["example.com"]);
             assert!(allow.loopback);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandboxed_launch_sets_log_path() {
+        let dir = std::env::temp_dir().join(format!("jail-lp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app =
+            AppEntry::new("t.desktop".into(), "t".into(), "i".into(), "/bin/true".into());
+        app.sandbox.enabled = true;
+        app.sandbox.allow_entries = vec!["example.com".into()];
+        let mode = prepare_launch_in(&dir, &app).unwrap();
+        let LaunchMode::Sandboxed { log_path, .. } = mode else {
+            panic!("expected sandboxed mode");
+        };
+        assert!(log_path.starts_with(dir.join("logs")));
+        assert!(log_path.to_string_lossy().ends_with(".jsonl"));
+        assert!(dir.join("logs").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_launch_has_no_log() {
+        let app = AppEntry::new("t.desktop".into(), "t".into(), "i".into(), "/bin/true".into());
+        match prepare_launch(&app).unwrap() {
+            LaunchMode::Plain => {}
+            other => panic!("expected plain mode, got {other:?}"),
         }
     }
 }
