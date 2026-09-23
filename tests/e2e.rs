@@ -120,5 +120,18 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
     assert!(buf.contains("fakeapp-stderr-marker"), "stderr captured: {buf:?}");
     assert!(total > 0);
 
+    // 5. non-root sandbox: the app must run as the invoking user's uid
+    //    (never root) inside the namespace — Electron apps refuse root.
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert!(!uid.is_empty() && uid != "0", "test host uid");
+    assert!(
+        buf.contains(&format!("uid={uid}")),
+        "app runs as uid {uid} (non-root) inside the sandbox: {buf:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&cfg_dir);
 }

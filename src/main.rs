@@ -1,6 +1,7 @@
 mod desktop_scan;
 mod launcher;
 mod model;
+mod ns_child;
 mod output_log;
 mod proxy;
 mod sandbox;
@@ -27,6 +28,13 @@ fn main() {
         let socket_path = args[2].clone();
         if let Err(e) = proxy::run_ns_relay(socket_path) {
             eprintln!("jail ns-relay: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.len() >= 4 && args[1] == "--ns-child" {
+        if let Err(e) = ns_child::run(&args[2..]) {
+            eprintln!("jail ns-child: {e}");
             std::process::exit(1);
         }
         return;

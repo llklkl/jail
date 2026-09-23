@@ -4,7 +4,6 @@
 use crate::model::AppEntry;
 use crate::output_log::{OutputLog, OutputLogRegistry};
 use crate::proxy::AllowList;
-use crate::sandbox;
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::process::CommandExt as _;
@@ -68,9 +67,9 @@ impl RunningRegistry {
 pub enum LaunchMode {
     /// Run the app directly, no sandbox.
     Plain,
-    /// Run inside unshare with the nft script + proxy bridge.
+    /// Run inside user+net+mount namespaces via the `--ns-child` helper.
+    /// The app runs as the invoking user (non-root) inside the namespace.
     Sandboxed {
-        nft_script: String,
         allow: AllowList,
         bridge_path: String,
         /// JSONL request log for this app (host side).
@@ -100,7 +99,6 @@ pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Resul
     if !app.sandbox.enabled {
         return Ok(LaunchMode::Plain);
     }
-    let nft_script = sandbox::build_nft_script(&app.sandbox);
     let allow = AllowList {
         entries: app
             .sandbox
@@ -120,7 +118,6 @@ pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Resul
     ));
     let _ = std::fs::remove_file(&bridge_path);
     Ok(LaunchMode::Sandboxed {
-        nft_script,
         allow,
         bridge_path: bridge_path.to_string_lossy().into_owned(),
         log_path: logs_dir.join(format!("{}.jsonl", app.id)),
@@ -136,46 +133,36 @@ pub fn prepare_launch(app: &AppEntry) -> Result<LaunchMode, LaunchError> {
 }
 
 /// Quote each word of an Exec value for use inside `sh -c`.
-fn shell_quote_words(exec: &str) -> String {
+///
+/// Per the freedesktop Exec spec, double quotes are argument delimiters, not
+/// part of the argument: `Exec="/opt/my app.appimage" %U` means the argument
+/// is `/opt/my app.appimage`. `strip_field_codes` keeps them literally, so
+/// each word has one pair of surrounding double quotes removed here — before
+/// the word is single-quoted for the shell. (Words with embedded spaces are
+/// still split by whitespace: a pre-existing limitation, unchanged.)
+pub(crate) fn shell_quote_words(exec: &str) -> String {
     exec.split_whitespace()
-        .map(|w| format!("'{}'", w.replace('\'', "'\\''")))
+        .map(|w| {
+            let unquoted = w
+                .strip_prefix('"')
+                .and_then(|w| w.strip_suffix('"'))
+                .filter(|w| !w.is_empty())
+                .unwrap_or(w);
+            format!("'{}'", unquoted.replace('\'', "'\\''"))
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
 /// Write text to a temp file and return its path. The name is unique per
 /// call (pid + sequence) so concurrent launches never clobber each other.
-fn write_temp_file(prefix: &str, content: &str) -> std::io::Result<String> {
+pub(crate) fn write_temp_file(prefix: &str, content: &str) -> std::io::Result<String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("{prefix}-{}-{n}.tmp", std::process::id()));
     std::fs::write(&path, content)?;
     Ok(path.to_string_lossy().into_owned())
-}
-
-/// Prepare an /etc/nsswitch.conf override for the sandbox: rewrite the
-/// `hosts:` line to `files dns` so glibc resolves via our relayed
-/// resolv.conf instead of nss-resolve, which reaches systemd-resolved
-/// through a host AF_UNIX socket and would leak DNS past the sandbox.
-/// Best-effort: returns None when the host has no nsswitch.conf.
-fn write_nsswitch_override() -> Option<String> {
-    let text = std::fs::read_to_string("/etc/nsswitch.conf").ok()?;
-    let mut out = String::with_capacity(text.len());
-    let mut replaced = false;
-    for line in text.lines() {
-        if line.trim_start().starts_with("hosts:") {
-            out.push_str("hosts:       files dns\n");
-            replaced = true;
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !replaced {
-        out.push_str("hosts:       files dns\n");
-    }
-    write_temp_file("jail-nss", &out).ok()
 }
 
 /// Path of the jail binary used for --bridge / --ns-relay helpers.
@@ -204,16 +191,14 @@ fn helper_exe() -> std::io::Result<std::path::PathBuf> {
 /// cap, never written to disk) keyed by app id in `logs`; the previous run's
 /// log is replaced on each launch.
 ///
-/// Sandboxed layout:
-/// ```text
-/// unshare -Urnm --map-root-user sh -c '
-///   ip link set lo up
-///   nft -f <rules>
-///   mount --bind <resolv.conf> /etc/resolv.conf
-///   jail --ns-relay <bridge.sock> &     # proxy inside ns
-///   exec <app>                                   # with proxy env vars
-/// '
-/// ```
+/// Sandboxed layout: the launcher spawns `jail --ns-child <allow.json>
+/// <bridge.sock> <exec...>`, which enters user+net+mount namespaces, maps
+/// the invoking user's own uid into them, performs the privileged setup
+/// (lo up, nftables ruleset, resolv.conf/nsswitch bind mounts) with raw
+/// syscalls, forks the ns relay, drops to the user's uid and execs the app.
+/// The app therefore runs as a NON-ROOT user inside the sandbox (Electron
+/// apps refuse to run as root), with no capabilities.
+///
 /// The host side runs `--bridge <bridge.sock> <allowlist.json>` before spawn.
 pub fn spawn_app(
     app: &AppEntry,
@@ -231,7 +216,6 @@ pub fn spawn_app(
             c
         }
         LaunchMode::Sandboxed {
-            nft_script,
             allow,
             bridge_path,
             log_path,
@@ -255,36 +239,28 @@ pub fn spawn_app(
                 .map_err(LaunchError::Spawn)?;
             std::mem::forget(bridge); // detached; self-exits when the socket file is removed
 
-            // 2. prepare ns-side files
-            let nft_file = write_temp_file("jail-nft", nft_script)
-                .map_err(LaunchError::Spawn)?;
-            let resolv_file = write_temp_file("jail-resolv", "nameserver 127.0.0.1\n")
-                .map_err(LaunchError::Spawn)?;
-            let nss_file = write_nsswitch_override();
-
-            // 3. inner script
-            let nss_mount = nss_file
-                .as_deref()
-                .map(|p| format!("mount --bind '{p}' /etc/nsswitch.conf && "))
-                .unwrap_or_default();
-            let inner = format!(
-                "ip link set lo up                  && nft -f '{nft_file}'                  && mount --bind '{resolv_file}' /etc/resolv.conf                  && {nss_mount}'{self_exe}' --ns-relay '{bridge_path}' & \
-                 RELAY=$!; \
-                 export HTTP_PROXY=http://127.0.0.1:8080 \
-                 HTTPS_PROXY=http://127.0.0.1:8080 \
-                 http_proxy=http://127.0.0.1:8080 \
-                 https_proxy=http://127.0.0.1:8080 \
-                 ALL_PROXY=http://127.0.0.1:8080 \
-                 all_proxy=http://127.0.0.1:8080 \
-                 NO_PROXY=localhost,127.0.0.1 \
-                 no_proxy=localhost,127.0.0.1; \
-                 sleep 0.5; \
-                 exec {}",
-                shell_quote_words(exec),
-                self_exe = self_exe.display(),
-            );
-            let mut c = Command::new("unshare");
-            c.args(["-Urnm", "--map-root-user", "/bin/sh", "-c", &inner]);
+            // 2. the ns-child process: namespaces + privileged setup +
+            //    relay fork + uid drop + exec app. Proxy env vars are set
+            //    here (they survive the exec chain into the app).
+            let mut c = Command::new(&self_exe);
+            c.args([
+                "--ns-child",
+                &allow_file,
+                bridge_path,
+                exec,
+            ]);
+            for (k, v) in [
+                ("HTTP_PROXY", "http://127.0.0.1:8080"),
+                ("HTTPS_PROXY", "http://127.0.0.1:8080"),
+                ("http_proxy", "http://127.0.0.1:8080"),
+                ("https_proxy", "http://127.0.0.1:8080"),
+                ("ALL_PROXY", "http://127.0.0.1:8080"),
+                ("all_proxy", "http://127.0.0.1:8080"),
+                ("NO_PROXY", "localhost,127.0.0.1"),
+                ("no_proxy", "localhost,127.0.0.1"),
+            ] {
+                c.env(k, v);
+            }
             c
         }
     };
@@ -367,6 +343,29 @@ mod tests {
             shell_quote_words("app --flag 'a b'"),
             "'app' '--flag' ''\\''a' 'b'\\'''"
         );
+    }
+
+    #[test]
+    fn quote_words_strips_double_quotes() {
+        // desktop Exec uses double quotes as argument delimiters; the stored
+        // exec keeps them literally (zcode case)
+        assert_eq!(
+            shell_quote_words("\"/opt/zcode.appimage\""),
+            "'/opt/zcode.appimage'"
+        );
+        // a double-quoted word containing a space is split by whitespace first
+        // (pre-existing limitation): each fragment keeps its unbalanced quote
+        assert_eq!(
+            shell_quote_words("\"/opt/my app.appimage\" --flag"),
+            "'\"/opt/my' 'app.appimage\"' '--flag'"
+        );
+        // no quotes / single quotes / inner-only quotes: unchanged
+        assert_eq!(shell_quote_words("/usr/bin/code"), "'/usr/bin/code'");
+        assert_eq!(shell_quote_words("'quoted'"), "''\\''quoted'\\'''");
+        assert_eq!(shell_quote_words("say\"hi\""), "'say\"hi\"'");
+        // a bare pair of quotes with nothing inside is not a valid argument:
+        // keep it literal rather than producing an empty word
+        assert_eq!(shell_quote_words("\"\""), "'\"\"'");
     }
 
     #[test]

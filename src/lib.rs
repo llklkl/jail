@@ -4,6 +4,7 @@
 pub mod desktop_scan;
 pub mod launcher;
 pub mod model;
+pub mod ns_child;
 pub mod output_log;
 pub mod proxy;
 pub mod sandbox;
