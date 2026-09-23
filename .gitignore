@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target/
+
+# Local dev dependencies (sysroot, cargo home, e2e scratch) — see build.sh
+/.devcache/
+
+# Stray logs
+*.log
