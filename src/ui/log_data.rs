@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 /// One host's aggregated traffic.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct HostSummary {
     pub host: String,
     pub allowed: u64,

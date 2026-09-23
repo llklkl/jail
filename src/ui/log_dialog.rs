@@ -101,34 +101,41 @@ pub fn present(
         let raw_view = raw_view.clone();
         let state = state.clone();
         let id = id.clone();
+        // last rendered summary rows: when unchanged, the row widgets (and
+        // their attached context menus) are left alone — rebuilding every
+        // tick would destroy an open popover menu.
+        let last_rendered: std::cell::RefCell<(Vec<super::log_data::HostSummary>, Option<AllowMode>)> =
+            std::cell::RefCell::new((Vec::new(), None));
         move || {
             let text = tail.read_all();
-            let last_ts = summarize(&text, 1)
-                .first()
-                .map(|h| h.last_ts)
-                .unwrap_or(0);
-            // rebuild summary (always remove row 0: rows shift on removal)
-            while let Some(child) = summary_list.row_at_index(0) {
-                summary_list.remove(&child);
-            }
             let rows = summarize(&text, MAX_SUMMARY_ROWS);
             let mode = current_mode(&state, &id);
-            if rows.is_empty() {
-                status_label.set_text("暂无记录 — 启动应用后，经过沙盒代理的连接和 DNS 查询会显示在这里");
-            } else {
-                status_label.set_text(&format!(
-                    "{} · {} 个主机 · 字典序 · 最近活动 {}",
-                    mode.title(),
-                    rows.len(),
-                    format_ts(last_ts)
-                ));
+            let mut rendered = last_rendered.borrow_mut();
+            let rows_changed = *rendered != (rows.clone(), Some(mode));
+            if rows_changed {
+                *rendered = (rows.clone(), Some(mode));
+                let last_ts = rows.iter().map(|h| h.last_ts).max().unwrap_or(0);
+                // rebuild summary (always remove row 0: rows shift on removal)
+                while let Some(child) = summary_list.row_at_index(0) {
+                    summary_list.remove(&child);
+                }
+                if rows.is_empty() {
+                    status_label.set_text("暂无记录 — 启动应用后，经过沙盒代理的连接和 DNS 查询会显示在这里");
+                } else {
+                    status_label.set_text(&format!(
+                        "{} · {} 个主机 · 字典序 · 最近活动 {}",
+                        mode.title(),
+                        rows.len(),
+                        format_ts(last_ts)
+                    ));
+                }
+                for h in &rows {
+                    let row = summary_row(h, mode);
+                    attach_row_menu(&row, &state, &id, &h.host, mode);
+                    summary_list.append(&row);
+                }
             }
-            for h in &rows {
-                let row = summary_row(h, mode);
-                attach_row_menu(&row, &state, &id, &h.host, mode);
-                summary_list.append(&row);
-            }
-            // raw view: last N lines
+            // raw view: last N lines (no popovers attached — always refresh)
             let raw: String = tail_lines(&text, RAW_VIEW_LINES)
                 .into_iter()
                 .map(|l| format!("{l}\n"))
