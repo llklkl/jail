@@ -101,40 +101,90 @@ pub fn present(
         let raw_view = raw_view.clone();
         let state = state.clone();
         let id = id.clone();
-        // last rendered summary rows: when unchanged, the row widgets (and
-        // their attached context menus) are left alone — rebuilding every
-        // tick would destroy an open popover menu.
-        let last_rendered: std::cell::RefCell<(Vec<super::log_data::HostSummary>, Option<AllowMode>)> =
-            std::cell::RefCell::new((Vec::new(), None));
+        // per-host row cache: rows are created once and updated in place —
+        // rebuilding them every tick would destroy the attached context
+        // menu (and an open popover with it). Rows are keyed by host and
+        // kept in sorted position (the summary is lexicographic).
+        let row_cache: Rc<std::cell::RefCell<Vec<(String, SummaryRow)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let last_status: Rc<std::cell::RefCell<Option<String>>> =
+            Rc::new(std::cell::RefCell::new(None));
+        let row_cache = row_cache.clone();
+        let last_status = last_status.clone();
         move || {
             let text = tail.read_all();
             let rows = summarize(&text, MAX_SUMMARY_ROWS);
             let mode = current_mode(&state, &id);
-            let mut rendered = last_rendered.borrow_mut();
-            let rows_changed = *rendered != (rows.clone(), Some(mode));
-            if rows_changed {
-                *rendered = (rows.clone(), Some(mode));
+
+            // status line (cheap, no menus attached)
+            let status = if rows.is_empty() {
+                "暂无记录 — 启动应用后，经过沙盒代理的连接和 DNS 查询会显示在这里".to_string()
+            } else {
                 let last_ts = rows.iter().map(|h| h.last_ts).max().unwrap_or(0);
-                // rebuild summary (always remove row 0: rows shift on removal)
-                while let Some(child) = summary_list.row_at_index(0) {
-                    summary_list.remove(&child);
-                }
-                if rows.is_empty() {
-                    status_label.set_text("暂无记录 — 启动应用后，经过沙盒代理的连接和 DNS 查询会显示在这里");
-                } else {
-                    status_label.set_text(&format!(
-                        "{} · {} 个主机 · 字典序 · 最近活动 {}",
-                        mode.title(),
-                        rows.len(),
-                        format_ts(last_ts)
-                    ));
-                }
-                for h in &rows {
-                    let row = summary_row(h, mode);
-                    attach_row_menu(&row, &state, &id, &h.host, mode);
-                    summary_list.append(&row);
-                }
+                format!(
+                    "{} · {} 个主机 · 字典序 · 最近活动 {}",
+                    mode.title(),
+                    rows.len(),
+                    format_ts(last_ts)
+                )
+            };
+            if last_status.borrow().as_deref() != Some(status.as_str()) {
+                *last_status.borrow_mut() = Some(status.clone());
+                status_label.set_text(&status);
             }
+
+            // sync rows with the (lexicographically sorted) summary:
+            // update existing rows in place, insert new ones at their sorted
+            // position, drop rows whose host vanished.
+            {
+                let mut cache = row_cache.borrow_mut();
+                let mut new_idx = 0usize;
+                let mut kept = Vec::with_capacity(cache.len());
+                for (host, mut row) in cache.drain(..) {
+                    match rows.get(new_idx).filter(|h| h.host == host) {
+                        Some(h) => {
+                            // same host at the same sorted position: update
+                            row.update(h, mode);
+                            kept.push((host, row));
+                            new_idx += 1;
+                        }
+                        None => {
+                            // either the host vanished or moved: reinsert at
+                            // its new sorted position
+                            match rows.iter().position(|h| h.host == host) {
+                                Some(_) => {
+                                    summary_list.remove(&row.row);
+                                    kept.push((host, row)); // re-added below
+                                }
+                                None => summary_list.remove(&row.row), // gone
+                            }
+                        }
+                    }
+                }
+                // insert/update remaining hosts in sorted order
+                for (at, h) in rows.iter().enumerate() {
+                    let existing = kept.iter_mut().find(|(k, _)| *k == h.host);
+                    match existing {
+                        Some((_, row)) => {
+                            row.update(h, mode);
+                            // ensure it sits at position `at`
+                            if row.row.index() != at as i32 {
+                                summary_list.remove(&row.row);
+                                summary_list.insert(&row.row, at as i32);
+                            }
+                        }
+                        None => {
+                            let row = SummaryRow::new(h, mode);
+                            attach_row_menu(&row.row, &state, &id, &h.host, mode);
+                            summary_list.insert(&row.row, at as i32);
+                            kept.push((h.host.clone(), row));
+                        }
+                    }
+                }
+                kept.sort_by(|a, b| a.0.cmp(&b.0));
+                *cache = kept;
+            }
+
             // raw view: last N lines (no popovers attached — always refresh)
             let raw: String = tail_lines(&text, RAW_VIEW_LINES)
                 .into_iter()
@@ -255,89 +305,135 @@ fn format_ts(ts: u64) -> String {
         .unwrap_or_else(|_| ts.to_string())
 }
 
-fn summary_row(h: &super::log_data::HostSummary, mode: AllowMode) -> gtk::ListBoxRow {
-    let row = gtk::ListBoxRow::new();
-    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    hbox.set_margin_top(6);
-    hbox.set_margin_bottom(6);
-    hbox.set_margin_start(8);
-    hbox.set_margin_end(8);
+/// The widgets of one summary row that change with the data. Kept per host
+/// so refreshes update labels in place — rebuilding rows would destroy the
+/// attached context menu (and an open popover with it).
+struct SummaryRow {
+    row: gtk::ListBoxRow,
+    chip: gtk::Label,
+    counts: gtk::Label,
+    bytes: gtk::Label,
+    last: gtk::Label,
+    /// the data currently rendered (to skip no-op updates)
+    rendered: super::log_data::HostSummary,
+    mode: AllowMode,
+}
 
-    // verdict chip: the most prominent element, colored green/red
-    let (chip_label, chip_class, chip_tooltip) = if h.denied > 0 && h.allowed > 0 {
-        ("部分放行", "log-chip-mixed", "有放行也有拒绝的连接")
-    } else if h.denied > 0 {
-        (
-            "已拒绝",
-            "log-chip-denied",
-            match mode {
-                AllowMode::Whitelist => "所有连接都被白名单拒绝",
-                AllowMode::Blacklist => "所有连接都被黑名单拒绝",
-            },
-        )
-    } else {
-        (
-            "已放行",
-            "log-chip-allowed",
-            match mode {
-                AllowMode::Whitelist => "连接被白名单放行",
-                AllowMode::Blacklist => "连接未被黑名单命中，已放行",
-            },
-        )
-    };
-    let chip = gtk::Label::new(Some(chip_label));
-    chip.set_valign(gtk::Align::Center);
-    chip.add_css_class("log-chip");
-    chip.add_css_class(chip_class);
-    chip.set_tooltip_text(Some(chip_tooltip));
-    hbox.append(&chip);
+impl SummaryRow {
+    fn new(h: &super::log_data::HostSummary, mode: AllowMode) -> Self {
+        let row = gtk::ListBoxRow::new();
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        hbox.set_margin_top(6);
+        hbox.set_margin_bottom(6);
+        hbox.set_margin_start(8);
+        hbox.set_margin_end(8);
 
-    // host + verdict counts
-    let left = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    left.set_valign(gtk::Align::Center);
-    let name = gtk::Label::new(Some(&h.host));
-    name.set_halign(gtk::Align::Start);
-    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    name.add_css_class("heading");
-    left.append(&name);
-    let mut counts = Vec::new();
-    if h.allowed > 0 {
-        counts.push(format!("✓ 放行 {}", h.allowed));
+        let chip = gtk::Label::new(None);
+        chip.set_valign(gtk::Align::Center);
+        chip.add_css_class("log-chip");
+        hbox.append(&chip);
+
+        // host + verdict counts
+        let left = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        left.set_valign(gtk::Align::Center);
+        let name = gtk::Label::new(Some(&h.host));
+        name.set_halign(gtk::Align::Start);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        name.add_css_class("heading");
+        left.append(&name);
+        let counts = gtk::Label::new(None);
+        counts.set_halign(gtk::Align::Start);
+        counts.add_css_class("dimmed");
+        counts.add_css_class("caption");
+        left.append(&counts);
+        hbox.append(&left);
+
+        // spacer
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        hbox.append(&spacer);
+
+        // bytes + last activity
+        let right = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        right.set_valign(gtk::Align::Center);
+        let bytes = gtk::Label::new(None);
+        bytes.set_halign(gtk::Align::End);
+        bytes.add_css_class("monospace");
+        right.append(&bytes);
+        let last = gtk::Label::new(None);
+        last.set_halign(gtk::Align::End);
+        last.add_css_class("dimmed");
+        last.add_css_class("caption");
+        right.append(&last);
+        hbox.append(&right);
+
+        row.set_child(Some(&hbox));
+
+        let mut r = SummaryRow {
+            row,
+            chip,
+            counts,
+            bytes,
+            last,
+            rendered: super::log_data::HostSummary::default(),
+            mode,
+        };
+        r.update(h, mode);
+        r
     }
-    if h.denied > 0 {
-        counts.push(format!("✗ 拒绝 {}", h.denied));
+
+    /// Refresh the row's labels from `h` (in place — the context menu
+    /// attached to the row survives).
+    fn update(&mut self, h: &super::log_data::HostSummary, mode: AllowMode) {
+        if *h == self.rendered && mode == self.mode {
+            return;
+        }
+        self.mode = mode;
+        self.rendered = h.clone();
+
+        let (chip_label, chip_class, chip_tooltip) = if h.denied > 0 && h.allowed > 0 {
+            ("部分放行", "log-chip-mixed", "有放行也有拒绝的连接")
+        } else if h.denied > 0 {
+            (
+                "已拒绝",
+                "log-chip-denied",
+                match mode {
+                    AllowMode::Whitelist => "所有连接都被白名单拒绝",
+                    AllowMode::Blacklist => "所有连接都被黑名单拒绝",
+                },
+            )
+        } else {
+            (
+                "已放行",
+                "log-chip-allowed",
+                match mode {
+                    AllowMode::Whitelist => "连接被白名单放行",
+                    AllowMode::Blacklist => "连接未被黑名单命中，已放行",
+                },
+            )
+        };
+        self.chip.set_text(chip_label);
+        for cls in ["log-chip-allowed", "log-chip-denied", "log-chip-mixed"] {
+            self.chip.remove_css_class(cls);
+        }
+        self.chip.add_css_class(chip_class);
+        self.chip.set_tooltip_text(Some(chip_tooltip));
+
+        let mut counts = Vec::new();
+        if h.allowed > 0 {
+            counts.push(format!("✓ 放行 {}", h.allowed));
+        }
+        if h.denied > 0 {
+            counts.push(format!("✗ 拒绝 {}", h.denied));
+        }
+        if h.dns > 0 {
+            counts.push(format!("DNS {}", h.dns));
+        }
+        self.counts.set_text(&counts.join(" · "));
+        self.bytes
+            .set_text(&format!("↑ {} ↓ {}", human_bytes(h.up), human_bytes(h.down)));
+        self.last.set_text(&format_ts(h.last_ts));
     }
-    if h.dns > 0 {
-        counts.push(format!("DNS {}", h.dns));
-    }
-    let sub = gtk::Label::new(Some(&counts.join(" · ")));
-    sub.set_halign(gtk::Align::Start);
-    sub.add_css_class("dimmed");
-    sub.add_css_class("caption");
-    left.append(&sub);
-    hbox.append(&left);
-
-    // spacer
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    hbox.append(&spacer);
-
-    // bytes + last activity
-    let right = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    right.set_valign(gtk::Align::Center);
-    let bytes = gtk::Label::new(Some(&format!("↑ {} ↓ {}", human_bytes(h.up), human_bytes(h.down))));
-    bytes.set_halign(gtk::Align::End);
-    bytes.add_css_class("monospace");
-    right.append(&bytes);
-    let last = gtk::Label::new(Some(&format_ts(h.last_ts)));
-    last.set_halign(gtk::Align::End);
-    last.add_css_class("dimmed");
-    last.add_css_class("caption");
-    right.append(&last);
-    hbox.append(&right);
-
-    row.set_child(Some(&hbox));
-    row
 }
 
 /// The app's current rule mode (read live so menu labels follow edits).
