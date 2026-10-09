@@ -3,7 +3,8 @@
 //! The host bridge appends events:
 //!   {"ts":..,"ev":"conn","id":"..","host":"..","port":443,"ok":true,"via":"domain"}
 //!   {"ts":..,"ev":"end","id":"..","up":123,"down":456,"dur_ms":789}
-//!   {"ts":..,"ev":"dns","qname":"..","qtype":"A"}
+//!   {"ts":..,"ev":"progress","id":"..","up":123,"down":456}
+//!   {"ts":..,"ev":"dns","qname":"..","qtype":"A","blocked":false}
 //!
 //! The UI aggregates them per host for the summary view and keeps the raw
 //! lines for the detail view.
@@ -18,6 +19,8 @@ pub struct HostSummary {
     pub allowed: u64,
     pub denied: u64,
     pub dns: u64,
+    /// DNS queries refused by the rules without being forwarded.
+    pub dns_blocked: u64,
     pub up: u64,
     pub down: u64,
     pub last_ts: u64,
@@ -110,10 +113,15 @@ pub fn summarize(text: &str, max_hosts: usize) -> Vec<HostSummary> {
             }
             Some("dns") => {
                 let qname = v.get("qname").and_then(|q| q.as_str()).unwrap_or("?");
+                let blocked = v.get("blocked").and_then(|b| b.as_bool()).unwrap_or(false);
                 let key = HostSummary::key_for(qname);
                 let entry = hosts.entry(key.clone()).or_default();
                 entry.host = key;
-                entry.dns += 1;
+                if blocked {
+                    entry.dns_blocked += 1;
+                } else {
+                    entry.dns += 1;
+                }
                 entry.last_ts = entry.last_ts.max(ts);
             }
             _ => {}
@@ -168,29 +176,35 @@ mod tests {
 {"ts":100,"ev":"conn","id":"1:0","host":"www.baidu.com","port":443,"ok":true,"via":"domain"}
 {"ts":101,"ev":"end","id":"1:0","up":1826,"down":5552,"dur_ms":92}
 {"ts":102,"ev":"conn","id":"1:1","host":"github.com","port":443,"ok":false,"via":"denied"}
-{"ts":103,"ev":"dns","qname":"www.baidu.com","qtype":"A"}
+{"ts":103,"ev":"dns","qname":"www.baidu.com","qtype":"A","blocked":false}
 {"ts":104,"ev":"conn","id":"1:2","host":"183.2.172.177 (www.baidu.com)","port":443,"ok":true,"via":"domain"}
 {"ts":105,"ev":"end","id":"1:2","up":100,"down":200,"dur_ms":50}
+{"ts":106,"ev":"dns","qname":"github.com","qtype":"A","blocked":true}
+{"ts":107,"ev":"dns","qname":"tracker.evil.com","qtype":"AAAA","blocked":true}
 "#;
 
     #[test]
     fn summarize_aggregates_and_sorts() {
         let s = summarize(SAMPLE, 100);
-        assert_eq!(s.len(), 2);
+        assert_eq!(s.len(), 3);
         // baidu: 2 allowed conns (one via attribution) + 1 dns + bytes
         let baidu = s.iter().find(|h| h.host == "www.baidu.com").unwrap();
         assert_eq!(baidu.allowed, 2);
         assert_eq!(baidu.dns, 1);
+        assert_eq!(baidu.dns_blocked, 0);
         assert_eq!(baidu.up, 1926);
         assert_eq!(baidu.down, 5752);
-        // github: denied only
+        // github: denied connect + refused dns
         let gh = s.iter().find(|h| h.host == "github.com").unwrap();
         assert_eq!(gh.denied, 1);
         assert_eq!(gh.allowed, 0);
+        assert_eq!(gh.dns_blocked, 1);
+        assert_eq!(gh.dns, 0);
         assert_eq!(gh.up + gh.down, 0);
-        // sorted lexicographically: github.com < www.baidu.com
+        // sorted lexicographically: github.com < tracker.evil.com < www.baidu.com
         assert_eq!(s[0].host, "github.com");
-        assert_eq!(s[1].host, "www.baidu.com");
+        assert_eq!(s[1].host, "tracker.evil.com");
+        assert_eq!(s[2].host, "www.baidu.com");
     }
 
     #[test]

@@ -28,6 +28,9 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格），支持按
     → AF_UNIX 桥 → 宿主侧 bridge（执行域名/IP/CIDR 黑白名单校验）→ 互联网
   - DNS：`/etc/resolv.conf` 绑定挂载为 `nameserver 127.0.0.1`，由 relay 经桥转发到宿主解析器
     （宿主侧解析，兼容 VPN / 内网 DNS）
+  - **DNS 拦截**：按黑白名单自动拦截——白名单下未列出的域名、黑名单下列出的域名，
+    DNS 查询直接返回 REFUSED（不转发，防 DNS 隧道/外传）；拦截的查询在访问日志
+    中计为「拦截 N」；名单内域名正常解析（归属学习不受影响）
   - **黑白名单**：白名单（默认，列表内放行/其余拒绝）或黑名单（列表内拒绝/其余放行）；
     匹配规则：域名精确匹配（`example.com`）、`*.example.com` 通配一级子域名、
     精确 IP、CIDR 网段
@@ -88,10 +91,11 @@ src/
 
 ## 测试
 
-`./build.sh test` 包含 50 个测试：
+`./build.sh test` 包含 54 个测试：
 
 - 单元测试：字段码剥离、store 读写/损坏恢复、IP/CIDR 解析、nft 批处理构建、
-  黑白名单判定（精确/通配域名、IP、CIDR、回环、双模式）、输出环形缓冲（轮转 / 硬截 / registry）、
+  黑白名单判定（精确/通配域名、IP、CIDR、回环、双模式）、DNS 拦截判定与
+  REFUSED 响应、DNS 拦截计数、输出环形缓冲（轮转 / 硬截 / registry）、
   真实进程 spawn（含 stdout/stderr 捕获与重置）、Exec 双引号剥离、规则文件写入
 - 端到端（`tests/e2e.rs`）：通过真实 `spawn_app` 路径启动沙盒内"假应用"，
   验证白名单域名可达（HTTP 200）、非白名单域名被拒、应用以非 root uid 运行、

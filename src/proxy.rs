@@ -143,6 +143,23 @@ impl AllowList {
     pub fn matches(&self, host: &str) -> bool {
         self.decide(host).0
     }
+
+    /// Decide whether a DNS query for `qname` may be forwarded to the host
+    /// resolver. Only Domain entries apply (IP/CIDR entries don't match
+    /// names); the mode decides the polarity:
+    /// - whitelist: listed → resolve, unlisted → refuse (anti-tunneling)
+    /// - blacklist: listed → refuse, unlisted → resolve
+    pub fn decide_dns(&self, qname: &str) -> bool {
+        let qname = qname.trim_end_matches('.').to_ascii_lowercase();
+        let listed = self.entries.iter().any(|e| {
+            matches!(classify_entry(e), Some(EntryKind::Domain))
+                && domain_entry_matches(e.trim(), &qname)
+        });
+        match self.mode {
+            crate::model::AllowMode::Whitelist => listed,
+            crate::model::AllowMode::Blacklist => !listed,
+        }
+    }
 }
 
 /// In blacklist mode the log's `via` field should say why the host was
@@ -315,13 +332,15 @@ impl EventLogger {
         }));
     }
 
-    /// Log one DNS query seen on the bridge.
-    pub fn log_dns(&self, qname: &str, qtype: &str) {
+    /// Log one DNS query seen on the bridge. `blocked` marks queries that
+    /// were refused by the rules without being forwarded.
+    pub fn log_dns(&self, qname: &str, qtype: &str, blocked: bool) {
         self.log_event(serde_json::json!({
             "ts": now_secs(),
             "ev": "dns",
             "qname": truncate_str(qname, 120),
             "qtype": qtype,
+            "blocked": blocked,
         }));
     }
 }
@@ -669,7 +688,7 @@ fn handle_bridge_conn(
     let req = read_frame(&mut stream)?;
     let req = String::from_utf8_lossy(&req).into_owned();
     if req == "DNS" {
-        return handle_dns_bridge(stream, logger, attribution);
+        return handle_dns_bridge(stream, allow, logger, attribution);
     }
     let Some(target) = req.strip_prefix("CONNECT ") else {
         logger.log_conn(&truncate_str(&req, 120), 0, false, "bad-request");
@@ -767,6 +786,7 @@ fn handle_bridge_conn(
 
 fn handle_dns_bridge(
     mut stream: UnixStream,
+    allow: Arc<std::sync::RwLock<AllowList>>,
     logger: Arc<EventLogger>,
     attribution: Arc<Attribution>,
 ) -> std::io::Result<()> {
@@ -776,19 +796,45 @@ fn handle_dns_bridge(
             Ok(q) => q,
             Err(_) => return Ok(()),
         };
-        if let Some((qname, _)) = parse_qname(&query) {
-            logger.log_dns(&qname, &dns_qtype(&query));
+        let qname_info = parse_qname(&query);
+        // DNS interception: per the app's rules (mode + domain entries),
+        // refuse queries for names that must not resolve. Decision happens
+        // here on the host side so rule edits take effect dynamically.
+        let blocked = qname_info
+            .as_ref()
+            .map(|(qname, _)| !allow.read().unwrap().decide_dns(qname))
+            .unwrap_or(false); // unparseable queries: forward (conservative)
+        if let Some((qname, _)) = &qname_info {
+            logger.log_dns(qname, &dns_qtype(&query), blocked);
         }
-        let resp = forward_dns(&query);
-        if !resp.is_empty() {
-            if let Some((qname, _)) = parse_qname(&query) {
-                for (ip, ttl) in extract_answer_ips(&resp) {
-                    attribution.learn(ip, &qname, ttl);
+        let resp = if blocked {
+            build_dns_refused(&query)
+        } else {
+            let resp = forward_dns(&query);
+            if !resp.is_empty() {
+                if let Some((qname, _)) = &qname_info {
+                    for (ip, ttl) in extract_answer_ips(&resp) {
+                        attribution.learn(ip, qname, ttl);
+                    }
                 }
             }
-        }
+            resp
+        };
         write_frame(&mut stream, &resp)?;
     }
+}
+
+/// Build a DNS REFUSED (rcode 5) response by echoing the query with patched
+/// flags: QR=1 (response), RA=1 (recursion available), RCODE=5. The question
+/// section is preserved verbatim; zero answer records (the query carries
+/// none, and ANCOUNT/NSCOUNT/ARCOUNT in the copied header stay 0).
+fn build_dns_refused(query: &[u8]) -> Vec<u8> {
+    let mut resp = query.to_vec();
+    if resp.len() >= 4 {
+        resp[2] |= 0x80; // QR = response
+        resp[3] = (resp[3] & 0xF0) | 0x80 | 0x05; // RA=1, RCODE=REFUSED
+    }
+    resp
 }
 
 fn forward_dns(query: &[u8]) -> Vec<u8> {
@@ -1119,6 +1165,46 @@ mod tests {
     }
 
     #[test]
+    fn dns_decision_follows_mode() {
+        // whitelist: listed domains resolve, everything else is refused
+        let w = allow(&["www.baidu.com", "*.baidu.com"], true);
+        assert!(w.decide_dns("www.baidu.com"));
+        assert!(w.decide_dns("a1.baidu.com")); // wildcard, one label
+        assert!(!w.decide_dns("baidu.com")); // base not covered by *.baidu.com
+        assert!(!w.decide_dns("github.com")); // not listed → refused
+        assert!(!w.decide_dns("a.b.baidu.com")); // two labels past wildcard
+        // case-insensitive + trailing dot tolerance
+        assert!(w.decide_dns("WWW.Baidu.COM."));
+        // IP/CIDR entries don't apply to qnames
+        let ip_only = allow(&["1.1.1.1", "10.0.0.0/8"], true);
+        assert!(!ip_only.decide_dns("anything.com"));
+
+        // blacklist: listed domains are refused, everything else resolves
+        let b = deny(&["tracker.evil.com"], true);
+        assert!(!b.decide_dns("tracker.evil.com"));
+        assert!(b.decide_dns("www.baidu.com"));
+        // trailing-dot form of a listed name is still caught
+        assert!(!b.decide_dns("tracker.evil.com."));
+    }
+
+    #[test]
+    fn dns_refused_response_shape() {
+        let q = build_query("Evil.Example.COM", 16); // TYPE16, odd case
+        let mut resp = build_dns_refused(&q);
+        assert_eq!(resp.len(), q.len(), "question echoed verbatim");
+        assert_eq!(&resp[12..], &q[12..], "question section preserved");
+        assert_ne!(resp[2] & 0x80, 0, "QR set");
+        assert_eq!(resp[3] & 0x0F, 5, "RCODE = REFUSED");
+        assert_ne!(resp[3] & 0x80, 0, "RA set");
+        // the parser still sees the original question
+        let (name, _) = parse_qname(&resp).unwrap();
+        assert_eq!(name, "evil.example.com");
+        // idempotent-ish: applying to a response must not corrupt rcode
+        resp = build_dns_refused(&resp);
+        assert_eq!(resp[3] & 0x0F, 5);
+    }
+
+    #[test]
     fn cidr_math() {
         assert!(cidr_contains(
             "10.0.0.0".parse().unwrap(),
@@ -1254,7 +1340,7 @@ mod tests {
             let logger = EventLogger::new(path.clone());
             let id = logger.log_conn("api.example.com", 443, true, "domain");
             logger.log_end(&id, 123, 4567, 900);
-            logger.log_dns("api.example.com", "A");
+            logger.log_dns("api.example.com", "A", false);
         }
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -1277,7 +1363,7 @@ mod tests {
     #[test]
     fn event_logger_disabled_drops() {
         let logger = EventLogger::disabled();
-        logger.log_dns("x.com", "A"); // must not panic
+        logger.log_dns("x.com", "A", false); // must not panic
         let id = logger.log_conn("x.com", 443, true, "domain");
         logger.log_end(&id, 1, 2, 3);
     }

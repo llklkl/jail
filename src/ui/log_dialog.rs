@@ -429,6 +429,9 @@ impl SummaryRow {
         if h.dns > 0 {
             counts.push(format!("DNS {}", h.dns));
         }
+        if h.dns_blocked > 0 {
+            counts.push(format!("拦截 {}", h.dns_blocked));
+        }
         self.counts.set_text(&counts.join(" · "));
         self.bytes
             .set_text(&format!("↑ {} ↓ {}", human_bytes(h.up), human_bytes(h.down)));

@@ -67,6 +67,11 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
     eprintln!("fakeapp: {result}");
     assert!(result.contains("allowed=2"), "allowed domain should work: {result}");
     assert!(result.contains("blocked=000"), "blocked domain must fail: {result}");
+    // DNS interception: the non-allowlisted domain must NOT resolve
+    assert!(
+        result.contains("dnsblocked=none"),
+        "blocked domain's DNS must be refused: {result}"
+    );
 
     // 2. the request log: allowed conn with bytes, denied conn, dns query
     let log = std::fs::read_to_string(log_path).expect("request log exists");
@@ -74,6 +79,14 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
     assert!(log.contains("\"ev\":\"dns\""), "dns queries logged");
     assert!(log.contains("www.baidu.com"), "allowed host logged");
     assert!(log.contains("github.com"), "blocked host logged");
+    assert!(
+        log.contains("\"blocked\":true"),
+        "non-allowlisted DNS must be intercepted: {log}"
+    );
+    assert!(
+        log.contains("\"blocked\":false"),
+        "allowlisted DNS must be forwarded: {log}"
+    );
     assert!(
         log.contains("\"via\":\"domain\""),
         "domain match recorded: {log}"
