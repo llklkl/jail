@@ -41,12 +41,20 @@ impl HostSummary {
     }
 }
 
-/// Aggregate a full log text into per-host summaries, ordered by total
-/// bytes (descending), capped at `max_hosts`.
+/// Aggregate a full log text into per-host summaries, ordered lexicographically
+/// by host key, capped at `max_hosts`.
+///
+/// Byte accounting: `end` events carry the connection's final totals;
+/// `progress` events carry cumulative totals for still-open connections.
+/// Per connection id we track the highest seen cumulative total (progress
+/// and end overlap — the last progress may equal the end values), so bytes
+/// are counted exactly once.
 pub fn summarize(text: &str, max_hosts: usize) -> Vec<HostSummary> {
     let mut hosts: HashMap<String, HostSummary> = HashMap::new();
-    // conn id → (host key, allowed) so `end` events land on the right host
+    // conn id → (host key, allowed) so byte events land on the right host
     let mut conns: HashMap<String, (String, bool)> = HashMap::new();
+    // conn id → highest cumulative (up, down) already added to the summary
+    let mut counted: HashMap<String, (u64, u64)> = HashMap::new();
 
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -70,7 +78,7 @@ pub fn summarize(text: &str, max_hosts: usize) -> Vec<HostSummary> {
                     conns.insert(id.to_string(), (key, ok));
                 }
             }
-            Some("end") => {
+            Some("progress") | Some("end") => {
                 let (up, down) = (
                     v.get("up").and_then(|u| u.as_u64()).unwrap_or(0),
                     v.get("down").and_then(|d| d.as_u64()).unwrap_or(0),
@@ -82,10 +90,19 @@ pub fn summarize(text: &str, max_hosts: usize) -> Vec<HostSummary> {
                     .cloned()
                 {
                     if let Some(entry) = hosts.get_mut(&key) {
-                        // only count bytes for connections that were allowed
                         if ok {
-                            entry.up += up;
-                            entry.down += down;
+                            // count only the delta above what was already
+                            // counted for this connection (progress events
+                            // are cumulative; end repeats the final total)
+                            let seen = counted.entry(id_key(&v)).or_insert((0, 0));
+                            if up > seen.0 {
+                                entry.up += up - seen.0;
+                                seen.0 = up;
+                            }
+                            if down > seen.1 {
+                                entry.down += down - seen.1;
+                                seen.1 = down;
+                            }
                         }
                         entry.last_ts = entry.last_ts.max(ts);
                     }
@@ -109,6 +126,14 @@ pub fn summarize(text: &str, max_hosts: usize) -> Vec<HostSummary> {
     out.sort_by(|a, b| a.host.cmp(&b.host));
     out.truncate(max_hosts);
     out
+}
+
+/// The connection id of a progress/end event.
+fn id_key(v: &serde_json::Value) -> String {
+    v.get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Human-readable byte count.
@@ -192,5 +217,35 @@ mod tests {
         assert_eq!(lines, vec!["c", "d"]);
         assert_eq!(tail_lines("", 5), Vec::<&str>::new());
         assert_eq!(tail_lines("x", 5), vec!["x"]);
+    }
+
+    #[test]
+    fn progress_events_count_increments_live() {
+        // a long download: progress events while open, end when closed —
+        // bytes must be counted exactly once (deltas, not repeats)
+        let text = r#"
+{"ts":100,"ev":"conn","id":"9:0","host":"cdn.example.com","port":443,"ok":true,"via":"default-allow"}
+{"ts":101,"ev":"progress","id":"9:0","up":100,"down":1000}
+{"ts":102,"ev":"progress","id":"9:0","up":100,"down":5000}
+{"ts":103,"ev":"progress","id":"9:0","up":100,"down":9000}
+{"ts":104,"ev":"end","id":"9:0","up":100,"down":9000,"dur_ms":3000}
+"#;
+        let s = summarize(text, 10);
+        let c = s.iter().find(|h| h.host == "cdn.example.com").unwrap();
+        assert_eq!(c.allowed, 1);
+        assert_eq!(c.up, 100);
+        assert_eq!(c.down, 9000, "progress deltas counted once, end not double");
+    }
+
+    #[test]
+    fn progress_only_open_connection_visible() {
+        // no end event at all (still downloading): progress bytes still show
+        let text = r#"
+{"ts":100,"ev":"conn","id":"9:1","host":"cdn.example.com","port":443,"ok":true,"via":"default-allow"}
+{"ts":101,"ev":"progress","id":"9:1","up":0,"down":42700000}
+"#;
+        let s = summarize(text, 10);
+        let c = s.iter().find(|h| h.host == "cdn.example.com").unwrap();
+        assert_eq!(c.down, 42_700_000);
     }
 }

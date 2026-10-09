@@ -301,6 +301,20 @@ impl EventLogger {
         }));
     }
 
+    /// Log cumulative transfer totals for a still-open connection, so long
+    /// transfers (big downloads, streams) show up before they close. The
+    /// counters are cumulative since connection start; consumers diff them
+    /// against the previous progress event for the same id.
+    pub fn log_progress(&self, id: &str, up: u64, down: u64) {
+        self.log_event(serde_json::json!({
+            "ts": now_secs(),
+            "ev": "progress",
+            "id": id,
+            "up": up,
+            "down": down,
+        }));
+    }
+
     /// Log one DNS query seen on the bridge.
     pub fn log_dns(&self, qname: &str, qtype: &str) {
         self.log_event(serde_json::json!({
@@ -717,6 +731,30 @@ fn handle_bridge_conn(
     write_frame(&mut stream, b"OK")?;
     let started = Instant::now();
     let counters = Counters::default();
+
+    // progress ticker: while the connection is open, emit cumulative byte
+    // counts every second so long transfers are visible before they close
+    {
+        let logger = logger.clone();
+        let id = id.clone();
+        let counters = counters.clone();
+        std::thread::spawn(move || {
+            let mut last_up = 0u64;
+            let mut last_down = 0u64;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let up = counters.up.load(Ordering::Relaxed);
+                let down = counters.down.load(Ordering::Relaxed);
+                if up == last_up && down == last_down {
+                    continue; // idle connection: no noise
+                }
+                logger.log_progress(&id, up, down);
+                last_up = up;
+                last_down = down;
+            }
+        });
+    }
+
     pump_bidir(&mut stream, &mut upstream, counters.clone());
     logger.log_end(
         &id,
