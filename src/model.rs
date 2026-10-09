@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// A sandbox allowlist entry: a domain (exact, or `*.example.com` wildcard
-/// matching exactly one subdomain label) or an IP / CIDR.
+/// matching the base plus any depth of subdomains) or an IP / CIDR.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
     /// domain name: `example.com` matches only itself;
-    /// `*.example.com` matches exactly one extra label (api.example.com,
-    /// but not a.b.example.com and not example.com itself)
+    /// `*.example.com` matches `example.com` itself and ANY depth of
+    /// subdomains (api.example.com ✓, a.b.example.com ✓)
     Domain,
     /// single IP address
     Ip,
@@ -135,7 +135,7 @@ pub struct SandboxConfig {
     /// Whether sandboxing is enabled for this app.
     #[serde(default)]
     pub enabled: bool,
-    /// Unified allowlist: domains (suffix match), IPs, CIDR ranges.
+    /// Unified allowlist: domains (wildcard = any-depth suffix), IPs, CIDR ranges.
     #[serde(default)]
     pub allow_entries: Vec<String>,
     /// Allow loopback + DNS to the system resolver (default true).

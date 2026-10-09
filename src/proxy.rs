@@ -73,7 +73,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 // Allowlist
 // ---------------------------------------------------------------------------
 
-/// Allowlist shared with the host bridge. Entries are domains (suffix
+/// Allowlist shared with the host bridge. Entries are domains (wildcard
 /// match), single IPs, or CIDR ranges — classified on demand via
 /// `model::classify_entry`. The list is interpreted according to `mode`:
 /// whitelist (entries allowed, rest denied) or blacklist (entries denied,
@@ -100,8 +100,8 @@ impl AllowList {
     /// - deny:  "loopback-denied" | "blacklisted" | "not-in-whitelist"
     ///
     /// Domain entries match by label: `example.com` matches only itself;
-    /// `*.example.com` matches exactly one extra label (api.example.com,
-    /// not a.b.example.com, not example.com itself).
+    /// `*.example.com` matches the base itself and any depth of subdomains
+    /// (api.example.com ✓, a.b.example.com ✓).
     pub fn decide(&self, host: &str) -> (bool, &'static str) {
         let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
         if host == "localhost" || host.starts_with("127.") || host == "::1" {
@@ -174,11 +174,11 @@ fn reason_for_deny(kind: &'static str) -> &'static str {
     }
 }
 
-/// Domain entry vs host matching, by label count:
+/// Domain entry vs host matching:
 ///   entry "example.com"    → host must equal "example.com"
-///   entry "*.example.com"  → host must be "example.com" plus exactly one
-///                            extra label (api.example.com ✓,
-///                            a.b.example.com ✗, example.com ✗)
+///   entry "*.example.com"  → host is "example.com" itself or any subdomain
+///                            at any depth (api.example.com ✓,
+///                            a.b.example.com ✓)
 /// Both sides are lowercased first. Entries are pre-validated by
 /// `classify_entry`, so '*' can only appear as the whole first label.
 fn domain_entry_matches(entry: &str, host: &str) -> bool {
@@ -189,10 +189,7 @@ fn domain_entry_matches(entry: &str, host: &str) -> bool {
             if base.is_empty() {
                 return false;
             }
-            match host.strip_suffix(&format!(".{base}")) {
-                Some(prefix) => !prefix.is_empty() && !prefix.contains('.'),
-                None => false,
-            }
+            host == base || host.ends_with(&format!(".{base}"))
         }
         None => entry == host,
     }
@@ -1112,18 +1109,19 @@ mod tests {
 
     #[test]
     fn allowlist_wildcard_domains() {
-        // wildcard: exactly one extra label
+        // wildcard: base itself + any depth of subdomains
         let a = allow(&["*.example.com"], false);
         assert_eq!(a.decide("api.example.com"), (true, "domain"));
         assert_eq!(a.decide("API.Example.COM"), (true, "domain"));
-        assert_eq!(a.decide("example.com"), (false, "not-in-whitelist")); // base itself not covered
-        assert_eq!(a.decide("a.b.example.com"), (false, "not-in-whitelist")); // two extra labels
+        assert_eq!(a.decide("example.com"), (true, "domain")); // base covered
+        assert_eq!(a.decide("a.b.example.com"), (true, "domain")); // any depth
         assert_eq!(a.decide("notexample.com"), (false, "not-in-whitelist"));
-        // deeper wildcard: one label at that depth
+        // deeper wildcard: base + any depth below it
         let b = allow(&["*.api.example.com"], false);
         assert_eq!(b.decide("v1.api.example.com"), (true, "domain"));
-        assert_eq!(b.decide("api.example.com"), (false, "not-in-whitelist"));
-        assert_eq!(b.decide("x.v1.api.example.com"), (false, "not-in-whitelist"));
+        assert_eq!(b.decide("x.v1.api.example.com"), (true, "domain"));
+        // base itself covered too (consistent with *.example.com → example.com)
+        assert_eq!(b.decide("api.example.com"), (true, "domain"));
         // case-insensitive entry
         let c = allow(&["*.EXAMPLE.com"], false);
         assert_eq!(c.decide("api.example.com"), (true, "domain"));
@@ -1170,9 +1168,9 @@ mod tests {
         let w = allow(&["www.baidu.com", "*.baidu.com"], true);
         assert!(w.decide_dns("www.baidu.com"));
         assert!(w.decide_dns("a1.baidu.com")); // wildcard, one label
-        assert!(!w.decide_dns("baidu.com")); // base not covered by *.baidu.com
+        assert!(w.decide_dns("baidu.com")); // base itself covered by *.baidu.com
+        assert!(w.decide_dns("a.b.baidu.com")); // any depth covered
         assert!(!w.decide_dns("github.com")); // not listed → refused
-        assert!(!w.decide_dns("a.b.baidu.com")); // two labels past wildcard
         // case-insensitive + trailing dot tolerance
         assert!(w.decide_dns("WWW.Baidu.COM."));
         // IP/CIDR entries don't apply to qnames

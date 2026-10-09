@@ -12,7 +12,7 @@ fn entry_subtitle(e: &str) -> String {
     match classify_entry(e) {
         Some(EntryKind::Domain) => {
             if e.trim().starts_with("*.") {
-                "通配 · 匹配一级子域名".into()
+                "通配 · 匹配任意深度子域名".into()
             } else {
                 "域名 · 精确匹配".into()
             }
