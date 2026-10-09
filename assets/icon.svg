@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Jail app icon: rounded-square dark backdrop, teal shield with keyhole,
+       subtle inner border. Matches the launcher's sandbox/security theme. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2430"/>
+      <stop offset="1" stop-color="#141821"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3ddc97"/>
+      <stop offset="1" stop-color="#1fa971"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bg)"/>
+  <rect x="30" y="30" width="452" height="452" rx="96" fill="none"
+        stroke="#3ddc97" stroke-opacity="0.25" stroke-width="6"/>
+  <!-- shield -->
+  <path d="M256 92 L388 142 V268 C388 344 332 396 256 424 C180 396 124 344 124 268 V142 Z"
+        fill="url(#shield)"/>
+  <!-- keyhole: circle + stem -->
+  <circle cx="256" cy="236" r="44" fill="#141821"/>
+  <rect x="240" y="268" width="32" height="84" rx="14" fill="#141821"/>
+</svg>

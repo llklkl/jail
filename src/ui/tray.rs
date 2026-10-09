@@ -11,11 +11,25 @@ use std::sync::mpsc::Sender;
 
 pub struct JailTray {
     tx: Sender<UiMsg>,
+    /// decoded ARGB32 pixmaps (largest first) from the embedded icons —
+    /// guaranteed to render even when the icon is not installed in a theme
+    pixmaps: Vec<ksni::Icon>,
 }
 
 impl JailTray {
     pub fn new(tx: Sender<UiMsg>) -> Self {
-        Self { tx }
+        let pixmaps = crate::icons::ICONS
+            .iter()
+            .filter_map(|(_, bytes)| {
+                let (w, h, rgba) = crate::icons::decode_png_rgba(bytes)?;
+                Some(ksni::Icon {
+                    width: w as i32,
+                    height: h as i32,
+                    data: crate::icons::rgba_to_argb32(&rgba),
+                })
+            })
+            .collect();
+        Self { tx, pixmaps }
     }
 
     fn send(&self, msg: UiMsg) {
@@ -29,7 +43,13 @@ impl Tray for JailTray {
     }
 
     fn icon_name(&self) -> String {
-        "application-x-executable".into()
+        // theme icon when `jail --install-desktop` has been run; panels
+        // without it fall back to the embedded pixmaps below
+        crate::icons::APP_ID.into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        self.pixmaps.clone()
     }
 
     fn title(&self) -> String {

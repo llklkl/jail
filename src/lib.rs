@@ -2,6 +2,7 @@
 //! launcher internals.
 
 pub mod desktop_scan;
+pub mod icons;
 pub mod launcher;
 pub mod model;
 pub mod ns_child;

@@ -137,6 +137,9 @@ fn build_ui(app: &adw::Application, registry: &Arc<RunningRegistry>) {
     let win = adw::ApplicationWindow::new(app);
     win.set_title(Some("Jail 启动器"));
     win.set_default_size(900, 640);
+    // window/taskbar icon (resolved from the theme; `jail --install-desktop`
+    // installs the icon into the user hicolor theme)
+    win.set_icon_name(Some(crate::icons::APP_ID));
 
     // --- tray: clicking X hides to tray; real quit lives in the tray menu
     let tray_active = tray::spawn(state.tx.clone());
@@ -238,7 +241,7 @@ fn build_ui(app: &adw::Application, registry: &Arc<RunningRegistry>) {
         about.connect_activate(move |_, _| {
             let dlg = adw::AboutDialog::builder()
                 .application_name("Jail 启动器")
-                .application_icon("application-x-executable")
+                .application_icon(crate::icons::APP_ID)
                 .developer_name("App Launcher")
                 .version(env!("CARGO_PKG_VERSION"))
                 .comments("Linux 应用启动器（top.llklkl.jail），支持按应用限制网络访问（域名 / IP）。")
@@ -746,3 +749,4 @@ pub fn entry_from_desktop(d: &DesktopApp) -> AppEntry {
         strip_field_codes(&d.exec),
     )
 }
+

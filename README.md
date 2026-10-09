@@ -26,6 +26,7 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格），支持按
   - **彻底退出时自动关闭所有由 jail 启动的沙盒应用**（SIGTERM → 等待 2s → SIGKILL），
     并清理 bridge/relay 进程（relay 监视 bridge socket 文件，自动跟随退出）
   - SIGTERM / Ctrl+C 同样触发优雅退出与清理；托盘不可用的环境自动降级为关窗即退出
+  - `jail --install-desktop`：安装桌面入口与图标（含托盘 pixmap），`--uninstall-desktop` 移除
 - **网络沙盒**（每个应用独立配置）：
   - 应用运行在独立 user+network+mount 命名空间中（无需 root），且以**当前用户身份（非 root）**
     运行 —— 命名空间内不持有任何 capability，Electron 应用可正常运行
@@ -97,7 +98,7 @@ src/
 
 ## 测试
 
-`./build.sh test` 包含 54 个测试：
+`./build.sh test` 包含 58 个测试：
 
 - 单元测试：字段码剥离、store 读写/损坏恢复、IP/CIDR 解析、nft 批处理构建、
   黑白名单判定（精确/通配域名、IP、CIDR、回环、双模式）、DNS 拦截判定与
