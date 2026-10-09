@@ -1,10 +1,11 @@
-//! UI assembly: main window, app grid, header bar, menus, dialogs.
+//! UI assembly: main window, app grid, header bar, menus, dialogs, tray.
 
 mod add_dialog;
 mod log_data;
 mod log_dialog;
 mod output_log_dialog;
 mod sandbox_dialog;
+mod tray;
 
 use crate::desktop_scan::{self, DesktopApp};
 use crate::launcher::{self, LaunchMode, RunningRegistry};
@@ -16,8 +17,8 @@ use adw::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc::{Receiver, Sender}, Arc};
 
 /// Messages from worker threads back to the UI loop.
 pub enum UiMsg {
@@ -27,7 +28,14 @@ pub enum UiMsg {
     LaunchFailed(String, String),
     /// A tracked app process exited.
     AppExited(String),
+    /// Restore the main window (tray icon click / tray menu).
+    ShowWindow,
+    /// Real quit: terminate all sandboxed apps, then exit.
+    Quit,
 }
+
+/// Whether the first minimize-to-tray hint notification was already sent.
+static MINIMIZE_HINT_SENT: AtomicBool = AtomicBool::new(false);
 
 /// Shared UI state.
 pub struct AppState {
@@ -53,8 +61,15 @@ pub fn run() {
         .application_id("top.llklkl.jail")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    app.connect_activate(build_ui);
+    // shared with build_ui so the post-run cleanup (below) can reach the
+    // same registry
+    let registry: Arc<RunningRegistry> = Arc::new(RunningRegistry::default());
+    let registry_for_build = Arc::clone(&registry);
+    app.connect_activate(move |app| build_ui(app, &registry_for_build));
     app.run();
+    // every exit path (tray quit, no-tray close, signal-triggered quit)
+    // funnels through here: make sure sandboxed apps don't outlive us
+    registry.terminate_all();
 }
 
 fn load_css() {
@@ -80,6 +95,7 @@ fn load_css() {
     .log-chip-allowed { background: alpha(@success_color, 0.22); color: @success_color; }
     .log-chip-denied { background: alpha(@error_color, 0.22); color: @error_color; }
     .log-chip-mixed { background: alpha(@warning_color, 0.22); color: @warning_color; }
+    .log-chip-dns { background: alpha(currentColor, 0.12); color: alpha(currentColor, 0.75); }
     "#;
     let provider = gtk::CssProvider::new();
     provider.load_from_string(css);
@@ -92,23 +108,27 @@ fn load_css() {
     }
 }
 
-fn build_ui(app: &adw::Application) {
+fn build_ui(app: &adw::Application, registry: &Arc<RunningRegistry>) {
     load_css();
 
     let store = Store::new();
     let apps = store.load();
-    let registry: Arc<RunningRegistry> = Arc::new(RunningRegistry::default());
     let logs: Arc<OutputLogRegistry> = Arc::new(OutputLogRegistry::default());
 
     // Channel from worker threads to the UI loop (std mpsc, drained by a
-    // periodic source on the main loop).
+    // periodic source on the main loop). The tray and the signal listener
+    // also send through it, marshalling their actions to the main thread.
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let rx = Arc::new(rx);
+
+    // graceful shutdown on SIGTERM / SIGINT (e.g. systemctl --user stop,
+    // kill <pid>): marshal to the UI thread so children die with us
+    install_signal_quit(tx.clone());
 
     let state = Rc::new(AppState {
         store,
         apps: RefCell::new(apps),
-        registry,
+        registry: registry.clone(),
         logs,
         badges: RefCell::new(HashMap::new()),
         tx,
@@ -117,6 +137,33 @@ fn build_ui(app: &adw::Application) {
     let win = adw::ApplicationWindow::new(app);
     win.set_title(Some("Jail 启动器"));
     win.set_default_size(900, 640);
+
+    // --- tray: clicking X hides to tray; real quit lives in the tray menu
+    let tray_active = tray::spawn(state.tx.clone());
+    // The guard must be dropped only at shutdown — hold() releases the
+    // application if the guard is dropped early, so forget it (intentional).
+    std::mem::forget(app.hold()); // keep running with no visible windows
+
+    {
+        // close → minimize (when a tray exists); the tray menu's 退出 is the
+        // real exit. Without a tray, closing the window quits as before.
+        let close_win = win.clone();
+        let close_app = app.clone();
+        win.connect_close_request(move |_| {
+            if tray_active {
+                close_win.set_visible(false);
+                if !MINIMIZE_HINT_SENT.swap(true, Ordering::Relaxed) {
+                    let n = gio::Notification::new("Jail 启动器");
+                    n.set_title("Jail 仍在后台运行");
+                    n.set_body(Some("沙盒应用不会被关闭。点击托盘图标恢复窗口，或从托盘菜单退出。"));
+                    close_app.send_notification(Some("minimized"), &n);
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+    }
 
     // --- header bar -------------------------------------------------------
     let header = adw::HeaderBar::new();
@@ -214,6 +261,20 @@ fn build_ui(app: &adw::Application) {
 
     redraw(&state, &win);
     win.present();
+}
+
+/// Block SIGTERM/SIGINT and spawn a watcher that turns them into a graceful
+/// `UiMsg::Quit` (children terminated, then exit).
+fn install_signal_quit(tx: Sender<UiMsg>) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])
+        .expect("install signal handlers");
+    std::thread::spawn(move || {
+        for sig in signals.forever() {
+            eprintln!("jail: received signal {sig}, shutting down");
+            tx.send(UiMsg::Quit).ok();
+        }
+    });
 }
 
 fn header_menu() -> gio::Menu {
@@ -632,6 +693,16 @@ fn handle_msg(state: &Rc<AppState>, win: &adw::ApplicationWindow, msg: UiMsg) {
         UiMsg::AppExited(id) => {
             if let Some(badge) = state.badges.borrow().get(&id) {
                 badge.set_visible(false);
+            }
+        }
+        UiMsg::ShowWindow => {
+            win.present();
+        }
+        UiMsg::Quit => {
+            // terminating children + bridge socket cleanup happens after the
+            // GTK main loop returns (ui::run), keeping this handler trivial
+            if let Some(app) = win.application() {
+                app.quit();
             }
         }
     }

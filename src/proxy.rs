@@ -905,7 +905,20 @@ fn parse_absolute_http(target: &str) -> Option<(String, u16)> {
 pub fn run_ns_relay(bridge_path: String) -> std::io::Result<()> {
     let http = TcpListener::bind("127.0.0.1:8080")?;
     let dns = TcpListener::bind("127.0.0.1:53")?;
-    let bridge = Arc::new(bridge_path);
+    let bridge = Arc::new(bridge_path.clone());
+
+    // Self-exit: when the app dies, the launcher removes the bridge socket
+    // file; without this poll the relay (a child of the exec'd app) would
+    // keep its netns alive forever.
+    {
+        let path = PathBuf::from(&bridge_path);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(2));
+            if !path.exists() {
+                std::process::exit(0);
+            }
+        });
+    }
 
     // DNS-over-TCP relay (glibc falls back to TCP when UDP truncates/fails).
     {

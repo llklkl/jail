@@ -37,6 +37,16 @@ impl RunningApp {
             None => true,
         }
     }
+
+    /// Send SIGTERM to the app process (graceful shutdown request).
+    /// Returns the pid when a signal was sent.
+    pub fn terminate(&mut self) -> Option<u32> {
+        let pid = self.child.as_ref()?.id();
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        Some(pid)
+    }
 }
 
 /// Registry of running apps, shared between UI and watcher threads.
@@ -55,6 +65,56 @@ impl RunningRegistry {
 
     pub fn remove(&self, app_id: &str) {
         self.inner.lock().unwrap().remove(app_id);
+    }
+
+    /// Terminate every running app (launcher shutdown): SIGTERM first, wait
+    /// up to 2s for graceful exit, then SIGKILL the stragglers. Also removes
+    /// each bridge socket file so bridges self-exit and relays (which watch
+    /// the same file) follow.
+    pub fn terminate_all(&self) {
+        let mut pids: Vec<(u32, Option<String>)> = Vec::new();
+        for handle in self.inner.lock().unwrap().values() {
+            let mut guard = handle.lock().unwrap();
+            if guard.is_alive() {
+                if let Some(pid) = guard.terminate() {
+                    pids.push((pid, guard.bridge_path.clone()));
+                }
+            } else if let Some(path) = &guard.bridge_path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if pids.is_empty() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut alive = 0usize;
+            for handle in self.inner.lock().unwrap().values() {
+                let mut guard = handle.lock().unwrap();
+                if guard.is_alive() {
+                    alive += 1;
+                } else if let Some(path) = &guard.bridge_path {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            if alive == 0 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // stragglers: SIGKILL
+        for handle in self.inner.lock().unwrap().values() {
+            let mut guard = handle.lock().unwrap();
+            if guard.is_alive() {
+                if let Some(child) = guard.child.as_mut() {
+                    let _ = child.kill();
+                }
+            }
+            if let Some(path) = &guard.bridge_path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
     }
 
     /// The running handle for an app, if any.
@@ -563,5 +623,31 @@ mod tests {
         let (buf2, total2) = log2.snapshot();
         assert_eq!((buf2.is_empty(), total2), (true, 0), "reset each launch");
         assert!(!Arc::ptr_eq(&log, &log2), "new OutputLog per launch");
+    }
+
+    #[test]
+    fn terminate_all_kills_children() {
+        let app = AppEntry::new(
+            "sleep.desktop".into(),
+            "sleep".into(),
+            "i".into(),
+            "/bin/sleep 30".into(),
+        );
+        let mode = prepare_launch(&app).unwrap();
+        let registry = RunningRegistry::default();
+        let logs = OutputLogRegistry::default();
+        let running = spawn_app(&app, &mode, &logs).unwrap();
+        let handle = registry.insert(running);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(handle.lock().unwrap().is_alive(), "sleep app running");
+
+        registry.terminate_all();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while handle.lock().unwrap().is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!handle.lock().unwrap().is_alive(), "child terminated");
+        assert!(!registry.is_running(&app.id), "registry entry reaped");
     }
 }

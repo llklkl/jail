@@ -391,6 +391,9 @@ impl SummaryRow {
         self.mode = mode;
         self.rendered = h.clone();
 
+        // chip: reflects CONNECT verdicts; a host with DNS activity only
+        // never connected, so show a neutral "仅 DNS" chip instead of the
+        // misleading "已放行"
         let (chip_label, chip_class, chip_tooltip) = if h.denied > 0 && h.allowed > 0 {
             ("部分放行", "log-chip-mixed", "有放行也有拒绝的连接")
         } else if h.denied > 0 {
@@ -402,7 +405,7 @@ impl SummaryRow {
                     AllowMode::Blacklist => "所有连接都被黑名单拒绝",
                 },
             )
-        } else {
+        } else if h.allowed > 0 {
             (
                 "已放行",
                 "log-chip-allowed",
@@ -411,9 +414,11 @@ impl SummaryRow {
                     AllowMode::Blacklist => "连接未被黑名单命中，已放行",
                 },
             )
+        } else {
+            ("仅 DNS", "log-chip-dns", "只有 DNS 查询记录，尚未建立连接")
         };
         self.chip.set_text(chip_label);
-        for cls in ["log-chip-allowed", "log-chip-denied", "log-chip-mixed"] {
+        for cls in ["log-chip-allowed", "log-chip-denied", "log-chip-mixed", "log-chip-dns"] {
             self.chip.remove_css_class(cls);
         }
         self.chip.add_css_class(chip_class);
