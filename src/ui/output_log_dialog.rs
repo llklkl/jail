@@ -99,7 +99,12 @@ pub fn present(
                 // replace everything with what we still have
                 b.set_text(&buf);
             } else {
-                let start = buf.len() - new_total as usize;
+                // snap to a char boundary — new_total is a byte count and may
+                // land mid-character after rotation shifted the buffer
+                let mut start = buf.len() - new_total as usize;
+                while start < buf.len() && !buf.is_char_boundary(start) {
+                    start += 1;
+                }
                 let tail = &buf[start..];
                 let mut end = b.end_iter();
                 b.insert(&mut end, tail);

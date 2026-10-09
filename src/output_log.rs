@@ -36,13 +36,20 @@ impl OutputLog {
         g.buf.push_str(&String::from_utf8_lossy(bytes));
         g.total += bytes.len() as u64;
         if g.buf.len() > MAX_OUTPUT_BYTES {
-            let keep_from = g.buf.len() - MAX_OUTPUT_BYTES;
+            // Byte offset — may land mid-UTF-8-character (app logs are often
+            // multibyte), so snap forward to a char boundary before slicing;
+            // a non-boundary index would panic the writer thread and poison
+            // this lock (crashing the viewer on its next refresh).
+            let mut cut = g.buf.len() - MAX_OUTPUT_BYTES;
+            while cut < g.buf.len() && !g.buf.is_char_boundary(cut) {
+                cut += 1;
+            }
             // Drop whole lines: cut just after the first newline at/after the
             // boundary. If the newest line alone exceeds the cap, cut hard.
-            let cut = g.buf[keep_from..]
+            let cut = g.buf[cut..]
                 .find('\n')
-                .map(|p| keep_from + p + 1)
-                .unwrap_or(keep_from);
+                .map(|p| cut + p + 1)
+                .unwrap_or(cut);
             g.buf.drain(..cut);
         }
     }
@@ -138,6 +145,37 @@ mod tests {
         assert_eq!(buf.len(), MAX_OUTPUT_BYTES);
         assert_eq!(total, (MAX_OUTPUT_BYTES + 4096) as u64);
         assert!(!buf.contains('\n'));
+    }
+
+    #[test]
+    fn multibyte_overflow_does_not_panic() {
+        // regression: the rotation cut used to slice at an arbitrary byte
+        // offset which can land mid-UTF-8-character (app logs with Chinese
+        // text) — panicking the writer thread and poisoning the lock, which
+        // crashed the log viewer on its next refresh.
+        let log = OutputLog::new();
+        let chunk = format!("{}\n", "中文字符日志输出".repeat(4000)); // multibyte
+        let chunk_bytes = chunk.len() as u64;
+        // push ~5 MiB through in 8 KiB-ish chunks, like the pipe pump does
+        for _ in 0..50 {
+            let bytes = chunk.as_bytes();
+            for part in bytes.chunks(8192) {
+                log.append(part);
+            }
+        }
+        let (buf, total) = log.snapshot();
+        assert!(buf.len() <= MAX_OUTPUT_BYTES);
+        assert!(total > 4 * MAX_OUTPUT_BYTES as u64, "payload must exceed the cap");
+        // the retained buffer must still be valid UTF-8 (it is a String, so
+        // merely reaching this point without panicking proves the fix)
+        assert!(buf.contains('\n'));
+        // snapshot → view arithmetic: the tail slice must also be boundary-safe
+        let new_total = total;
+        let mut start = buf.len() - (new_total as usize).min(buf.len());
+        while start < buf.len() && !buf.is_char_boundary(start) {
+            start += 1;
+        }
+        let _tail = &buf[start..];
     }
 
     #[test]
