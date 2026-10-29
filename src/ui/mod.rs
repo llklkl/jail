@@ -57,15 +57,42 @@ fn drain_msgs(state: &Rc<AppState>, win: &adw::ApplicationWindow, rx: &Receiver<
 }
 
 pub fn run() {
-    let app = adw::Application::builder()
-        .application_id("top.llklkl.jail")
-        .flags(gio::ApplicationFlags::NON_UNIQUE)
-        .build();
-    // shared with build_ui so the post-run cleanup (below) can reach the
-    // same registry
     let registry: Arc<RunningRegistry> = Arc::new(RunningRegistry::default());
     let registry_for_build = Arc::clone(&registry);
-    app.connect_activate(move |app| build_ui(app, &registry_for_build));
+
+    // Single instance: without NON_UNIQUE, GApplication claims the
+    // `top.llklkl.jail` bus name. A second `jail` registers as a remote —
+    // its run() forwards `activate` to the primary (which re-presents its
+    // window) and exits 0 without building any UI. Registration needs a
+    // session bus; without one, keep the old degraded standalone behavior.
+    let app = {
+        let unique = adw::Application::builder()
+            .application_id("top.llklkl.jail")
+            .build();
+        match unique.register(None::<&gio::Cancellable>) {
+            Ok(()) => unique,
+            Err(_) => adw::Application::builder()
+                .application_id("top.llklkl.jail")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build(),
+        }
+    };
+
+    // The first activation builds the UI; later ones (forwarded from a
+    // second `jail` process, possibly while the window hides in the tray)
+    // must only present the existing window — never rebuild tray/registry.
+    let win_slot: Rc<RefCell<Option<adw::ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    {
+        let win_slot = Rc::clone(&win_slot);
+        app.connect_activate(move |app| {
+            if let Some(win) = win_slot.borrow().as_ref() {
+                win.present();
+                return;
+            }
+            let win = build_ui(app, &registry_for_build);
+            *win_slot.borrow_mut() = Some(win);
+        });
+    }
     app.run();
     // every exit path (tray quit, no-tray close, signal-triggered quit)
     // funnels through here: make sure sandboxed apps don't outlive us
@@ -108,7 +135,7 @@ fn load_css() {
     }
 }
 
-fn build_ui(app: &adw::Application, registry: &Arc<RunningRegistry>) {
+fn build_ui(app: &adw::Application, registry: &Arc<RunningRegistry>) -> adw::ApplicationWindow {
     load_css();
 
     let store = Store::new();
@@ -264,6 +291,7 @@ fn build_ui(app: &adw::Application, registry: &Arc<RunningRegistry>) {
 
     redraw(&state, &win);
     win.present();
+    win
 }
 
 /// Block SIGTERM/SIGINT and spawn a watcher that turns them into a graceful
