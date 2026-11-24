@@ -264,21 +264,28 @@ pub(crate) fn write_temp_file(prefix: &str, content: &str) -> std::io::Result<St
 }
 
 /// Path of the jail binary used for --bridge / --ns-relay helpers.
-/// `current_exe()` points at the test binary under `cargo test`, so prefer
-/// the sibling `jail` binary when it exists.
+/// When the running process is jail itself, reuse it directly. Under
+/// `cargo test`, `current_exe()` is a test binary that may live several
+/// directories deep — with cargo >= 1.100 integration tests land in
+/// `target/debug/build/<pkg>/<hash>/out/` where no `jail` sibling exists
+/// (older cargo used `target/debug/deps/e2e-xxxx`). Walk up the ancestor
+/// directories to find the compiled `jail` binary; fall back to the current
+/// executable (correct whenever the process is jail itself, e.g. installed
+/// into PATH).
 fn helper_exe() -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
-    let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let candidate = dir.join("jail");
-    if candidate.exists() {
-        return Ok(candidate);
+    if exe.file_stem() == Some(std::ffi::OsStr::new("jail")) {
+        return Ok(exe);
     }
-    // target/debug/deps/e2e-xxxx -> target/debug/jail
-    if let Some(deps) = dir.parent() {
-        let candidate = deps.join("jail");
-        if candidate.exists() {
+    let mut dir = exe.parent().map(std::path::Path::to_path_buf);
+    while let Some(d) = dir {
+        let candidate = d.join("jail");
+        // is_file (not exists): an ancestor *directory* named `jail` (e.g.
+        // target/debug/build/jail) must not be mistaken for the binary.
+        if candidate.is_file() {
             return Ok(candidate);
         }
+        dir = d.parent().map(std::path::Path::to_path_buf);
     }
     Ok(exe)
 }
