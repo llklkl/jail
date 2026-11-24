@@ -76,10 +76,15 @@ jobs:
           path: jail_*.deb
 
   rpm:
-    name: Build RPM (Fedora)
+    name: Build RPM (Fedora ${{ matrix.fedora_version }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 受支持的 Fedora 发布版；新增版本在此追加
+        fedora_version: [44, 45]
     container:
-      image: fedora:latest
+      image: fedora:${{ matrix.fedora_version }}
     steps:
       # fedora 最小容器不带 git，须先于 checkout 安装
       - name: Install toolchain & build deps
@@ -99,6 +104,7 @@ jobs:
           esac
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
+          echo "FC=${{ matrix.fedora_version }}" >> "$GITHUB_ENV"
 
       - name: Build (release, locked)
         run: cargo build --release --locked
@@ -119,13 +125,18 @@ jobs:
           TOP="$HOME/rpmbuild"
           mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
           tar -C pkg -czf "$TOP/SOURCES/jail-$VER-payload.tar.gz" usr
-          rpmbuild -bb --define "pkgver $VER" --define "_topdir $TOP" packaging/jail.spec
+          # dist 宏注入 Release: 1.fc44 / 1.fc45，产物文件名按发行版区分
+          rpmbuild -bb \
+            --define "pkgver $VER" \
+            --define "dist .fc$FC" \
+            --define "_topdir $TOP" \
+            packaging/jail.spec
           find "$TOP/RPMS" -name '*.rpm' -exec cp {} . \;
           ls -la *.rpm
 
       - uses: actions/upload-artifact@v4
         with:
-          name: rpm
+          name: rpm-fc${{ matrix.fedora_version }}
           path: jail-*.rpm
 
   release:

@@ -1,6 +1,7 @@
 # jail RPM spec — 二进制直载打包。
-# CI（Fedora 容器）编译 release 后，把暂存的 usr/ 树打成 payload tar.gz
-# 作为 Source0 交给本 spec；版本由流水线注入：rpmbuild --define 'pkgver x.y.z'。
+# CI（Fedora 容器，matrix 覆盖受支持的发布版）编译 release 后，把暂存的
+# usr/ 树打成 payload tar.gz 作为 Source0 交给本 spec；由流水线注入：
+#   rpmbuild --define 'pkgver x.y.z' --define 'dist .fcNN'
 # 仓库尚无 LICENSE 文件，故暂不写 License 头（rpmbuild 不强制，rpmlint 会提示）。
 
 Name:           jail
