@@ -19,18 +19,23 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格）。
 
 %prep
 # payload tarball 顶层为 %{name}-%{version}/（标准上游布局，CI 打包时生成）。
-# rpm >= 6.1：%prep 自动解包全部 Source 到 %{builddir} 并 cd 进
-#   buildsubdir（默认 <name>-<version>），文件已就位，无需动作；
-# rpm 4.x：不自动解包 —— 此处手动解到同一位置（--strip-components=1
-#   去掉顶层目录），保证两个版本代次行为一致。
-if [ ! -d %{builddir}/%{name}-%{version}/usr ]; then
-    mkdir -p %{builddir}/%{name}-%{version}
-    tar -xzf %{SOURCE0} -C %{builddir}/%{name}-%{version} --strip-components=1
-fi
+# 解包用 gzip|tar 管道形式（与 rpm >= 6.1 自身自动解包的管线一致，实测
+# 可靠）；CI 容器内 GNU tar 的 tar -xzf FILE -C DIR --strip-components=1
+# 组合出现过程序性解出空目录的问题（v0.1.0 run5/run7）。
+mkdir -p %{builddir}/%{name}-%{version}
+gzip -dc %{SOURCE0} | tar -xf - -C %{builddir}/%{name}-%{version} --strip-components=1
 
 %install
 mkdir -p %{buildroot}
-cp -a %{builddir}/%{name}-%{version}/usr/. %{buildroot}/
+# 整树拷贝 usr 目录本身（BUILDROOT/usr/...，与 %files 清单对齐；
+# 勿用 usr/. 平铺内容 —— 那会把 bin/share 平铺到 BUILDROOT 根下）
+cp -a %{builddir}/%{name}-%{version}/usr %{buildroot}/
+# 边界自检：%install 与 %files 之间若发生内容丢失立即报错定位
+test -f %{buildroot}/usr/bin/jail || {
+    echo "ERROR: BUILDROOT/usr/bin/jail missing after install"
+    ls -laR %{buildroot} | head -30
+    exit 1
+}
 
 %files
 %license /usr/share/licenses/jail/LICENSE
