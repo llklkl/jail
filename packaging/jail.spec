@@ -18,11 +18,15 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格）。
 校验，DNS 按名单直接拦截（fail closed）。
 
 %prep
-%setup -c -q
+# 不用 %setup：rpm 6.1 的 %setup -c + rpmuncompress 对顶层非 name-version
+# 布局的 payload 会解出空目录（v0.1.0 CI 实测）。手动解包到 %{builddir}
+# 下的固定位置，%install 用同一绝对路径取用，对 rpm 4.x/6.x 都成立。
+mkdir -p %{builddir}/payload
+tar -xzf %{SOURCE0} -C %{builddir}/payload
 
 %install
 mkdir -p %{buildroot}
-cp -a usr/. %{buildroot}/
+cp -a %{builddir}/payload/usr/. %{buildroot}/
 
 %files
 %license /usr/share/licenses/jail/LICENSE
@@ -31,3 +35,7 @@ cp -a usr/. %{buildroot}/
 /usr/share/icons/hicolor/64x64/apps/top.llklkl.jail.png
 /usr/share/icons/hicolor/128x128/apps/top.llklkl.jail.png
 /usr/share/icons/hicolor/256x256/apps/top.llklkl.jail.png
+
+%changelog
+* Tue Nov 24 2026 llklkl <llklkl@users.noreply.github.com> - %{pkgver}-1
+- Automated package build; see the git log for changes.
