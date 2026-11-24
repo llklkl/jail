@@ -199,6 +199,7 @@ jobs:
       - name: Create release and upload packages
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }} # 本 job 无 checkout，需显式指定仓库
           TAG: ${{ github.ref_name }}
         run: |
           ls -la dist/
