@@ -166,11 +166,15 @@ jobs:
             ls -laR pkg | head -40
             exit 1
           fi
-          # dist 宏注入 Release: 1.fc44 / 1.fc45，产物文件名按发行版区分
+          # dist 宏注入 Release: 1.fc44 / 1.fc45，产物文件名按发行版区分。
+          # __os_install_post 置空：payload 为预编译直载（二进制已 strip、
+          # 无脚本/man 页），不需要任何 BRP 后处理；实测 F44/45 的
+          # add-det BRP（rpm 6.1 依赖探测）会把 BUILDROOT/usr 整树吞掉
           rpmbuild -bb \
             --define "pkgver $VER" \
             --define "dist .fc$FC" \
             --define "_topdir $TOP" \
+            --define '__os_install_post %{nil}' \
             packaging/jail.spec
           find "$TOP/RPMS" -name '*.rpm' -exec cp {} . \;
           ls -la *.rpm
