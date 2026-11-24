@@ -41,6 +41,7 @@ test -f %{buildroot}/usr/bin/jail || {
 %license /usr/share/licenses/jail/LICENSE
 /usr/bin/jail
 /usr/share/applications/top.llklkl.jail.desktop
+/usr/share/doc/jail/copyright
 /usr/share/icons/hicolor/64x64/apps/top.llklkl.jail.png
 /usr/share/icons/hicolor/128x128/apps/top.llklkl.jail.png
 /usr/share/icons/hicolor/256x256/apps/top.llklkl.jail.png
