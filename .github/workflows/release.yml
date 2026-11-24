@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Derive version / arch from tag
+      - name: Derive version / distro / arch from tag
         run: |
           VER="${GITHUB_REF_NAME#v}"
           VER="${VER//-/~}" # 0.1.0-rc1 -> 0.1.0~rc1（deb 预发布排序语义）
@@ -34,11 +34,14 @@ jobs:
           esac
           echo "VER=$VER" >> "$GITHUB_ENV"
           echo "ARCH=$(uname -m | sed -e 's/^x86_64$/amd64/' -e 's/^aarch64$/arm64/')" >> "$GITHUB_ENV"
+          # 发行版代号（Ubuntu 24.04 -> noble），随 runner 镜像版本自动跟进
+          echo "DISTRO=$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")" >> "$GITHUB_ENV"
 
       - name: Install GTK4 / libadwaita devel packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
+          # libclang-dev：rustables 的 bindgen 构建脚本依赖 libclang
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev libclang-dev
 
       - name: Build (release, locked)
         run: |
@@ -67,12 +70,13 @@ jobs:
           PKG=pkg
           mkdir -p "$PKG/DEBIAN"
           sed -e "s/@VERSION@/$VER/" -e "s/@ARCH@/$ARCH/" packaging/deb.control > "$PKG/DEBIAN/control"
-          dpkg-deb --build --root-owner-group "$PKG" "jail_${VER}_${ARCH}.deb"
-          dpkg-deb --info "jail_${VER}_${ARCH}.deb"
+          # 包名格式：jail_<版本>_<发行版本名称>_<cpu架构>.deb
+          dpkg-deb --build --root-owner-group "$PKG" "jail_${VER}_${DISTRO}_${ARCH}.deb"
+          dpkg-deb --info "jail_${VER}_${DISTRO}_${ARCH}.deb"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: deb
+          name: deb-${{ env.DISTRO }}
           path: jail_*.deb
 
   rpm:
@@ -86,10 +90,10 @@ jobs:
     container:
       image: fedora:${{ matrix.fedora_version }}
     steps:
-      # fedora 最小容器不带 git，须先于 checkout 安装
+      # fedora 最小容器不带 git；clang-devel 供 rustables 的 bindgen 使用
       - name: Install toolchain & build deps
         run: |
-          dnf install -y git cargo gcc gtk4-devel libadwaita-devel rpm-build
+          dnf install -y git cargo gcc clang-devel gtk4-devel libadwaita-devel rpm-build
           rustc --version
 
       - uses: actions/checkout@v4
