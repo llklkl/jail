@@ -18,15 +18,15 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格）。
 校验，DNS 按名单直接拦截（fail closed）。
 
 %prep
-# payload tarball 顶层为 %{name}-%{version}/（标准上游布局，CI 打包时生成）。
-# rpm >= 6.1：%prep 自动解包全部 Source 到 %{builddir} 并 cd 进
-#   buildsubdir（默认 <name>-<version>），文件已就位，无需动作；
-# rpm 4.x：不自动解包 —— 此处手动解到同一位置（--strip-components=1
-#   去掉顶层目录），保证两个版本代次行为一致。
+# 诊断探针：确认 cwd、builddir 与解包前后的实际内容
+echo "PREP cwd=$(pwd) builddir=%{builddir}"
+ls -la %{builddir} 2>/dev/null || true
 if [ ! -d %{builddir}/%{name}-%{version}/usr ]; then
     mkdir -p %{builddir}/%{name}-%{version}
     tar -xzf %{SOURCE0} -C %{builddir}/%{name}-%{version} --strip-components=1
 fi
+echo "PREP extracted tree:"
+find %{builddir}/%{name}-%{version} -maxdepth 2 || true
 
 %install
 mkdir -p %{buildroot}

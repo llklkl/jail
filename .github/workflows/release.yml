@@ -158,6 +158,14 @@ jobs:
           TOP="$HOME/rpmbuild"
           mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
           tar -C pkg -czf "$TOP/SOURCES/jail-$VER-payload.tar.gz" "jail-$VER"
+          # 自检：tarball 必须含完整二进制，否则 fail fast 定位问题在打包侧
+          tar -tzf "$TOP/SOURCES/jail-$VER-payload.tar.gz" | head -3
+          TARBALL_HITS=$(tar -tzf "$TOP/SOURCES/jail-$VER-payload.tar.gz" | grep -c 'usr/bin/jail$' || true)
+          if [ "$TARBALL_HITS" != "1" ]; then
+            echo "::error::payload tarball 缺少 usr/bin/jail（命中 $TARBALL_HITS）"
+            ls -laR pkg | head -40
+            exit 1
+          fi
           # dist 宏注入 Release: 1.fc44 / 1.fc45，产物文件名按发行版区分
           rpmbuild -bb \
             --define "pkgver $VER" \
