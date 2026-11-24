@@ -18,30 +18,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  deb:
-    name: Build DEB (Ubuntu 24.04)
+  # 同 CPU 架构只编译一次：产物与桌面集成 payload（usr/ 树）打包后供
+  # deb / rpm 各发行版任务复用，各打包 job 不再重复编译。
+  # 构建机选 ubuntu-24.04（glibc 2.39）：目标发行版 glibc 必须 >= 构建机
+  # （Fedora 44/45 满足）；未来加入更老 glibc 的目标时需为其单独构建。
+  build:
+    name: Build (release, x86_64)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Derive version / distro / arch from tag
-        run: |
-          VER="${GITHUB_REF_NAME#v}"
-          VER="${VER//-/~}" # 0.1.0-rc1 -> 0.1.0~rc1（deb 预发布排序语义）
-          case "$VER" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::tag 必须形如 v1.2.3 或 v1.2.3-rc1，当前: $GITHUB_REF_NAME"; exit 1 ;;
-          esac
-          echo "VER=$VER" >> "$GITHUB_ENV"
-          echo "ARCH=$(uname -m | sed -e 's/^x86_64$/amd64/' -e 's/^aarch64$/arm64/')" >> "$GITHUB_ENV"
-          # 发行版代号（Ubuntu 24.04 -> noble），随 runner 镜像版本自动跟进
-          echo "DISTRO=$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")" >> "$GITHUB_ENV"
+      - name: Derive arch
+        run: echo "ARCH_RAW=$(uname -m)" >> "$GITHUB_ENV"
 
-      - name: Install GTK4 / libadwaita devel packages
+      - name: Install build deps
         run: |
           sudo apt-get update
           # libclang-dev：rustables 的 bindgen 构建脚本依赖 libclang
-          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev libclang-dev
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libclang-dev
 
       - name: Build (release, locked)
         run: |
@@ -65,13 +60,45 @@ jobs:
           rm -f "$PKG/usr/share/applications/mimeinfo.cache"
           find "$PKG" -type f | sort
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: payload-${{ env.ARCH_RAW }}
+          path: pkg
+
+  deb:
+    name: Build DEB (Ubuntu 24.04)
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version / distro / arch from tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          VER="${VER//-/~}" # 0.1.0-rc1 -> 0.1.0~rc1（deb 预发布排序语义）
+          case "$VER" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag 必须形如 v1.2.3 或 v1.2.3-rc1，当前: $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "ARCH=$(uname -m | sed -e 's/^x86_64$/amd64/' -e 's/^aarch64$/arm64/')" >> "$GITHUB_ENV"
+          echo "ARCH_RAW=$(uname -m)" >> "$GITHUB_ENV"
+          # 发行版代号（Ubuntu 24.04 -> noble），随 runner 镜像版本自动跟进
+          echo "DISTRO=$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: payload-${{ env.ARCH_RAW }}
+          path: pkg
+
       - name: Build DEB
         run: |
-          PKG=pkg
-          mkdir -p "$PKG/DEBIAN"
-          sed -e "s/@VERSION@/$VER/" -e "s/@ARCH@/$ARCH/" packaging/deb.control > "$PKG/DEBIAN/control"
+          # artifact 传输可能丢失可执行位，显式恢复
+          chmod 755 pkg/usr/bin/jail
+          mkdir -p pkg/DEBIAN
+          sed -e "s/@VERSION@/$VER/" -e "s/@ARCH@/$ARCH/" packaging/deb.control > pkg/DEBIAN/control
           # 包名格式：jail_<版本>_<发行版本名称>_<cpu架构>.deb
-          dpkg-deb --build --root-owner-group "$PKG" "jail_${VER}_${DISTRO}_${ARCH}.deb"
+          dpkg-deb --build --root-owner-group pkg "jail_${VER}_${DISTRO}_${ARCH}.deb"
           dpkg-deb --info "jail_${VER}_${DISTRO}_${ARCH}.deb"
 
       - uses: actions/upload-artifact@v4
@@ -81,6 +108,7 @@ jobs:
 
   rpm:
     name: Build RPM (Fedora ${{ matrix.fedora_version }})
+    needs: build
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -90,11 +118,9 @@ jobs:
     container:
       image: fedora:${{ matrix.fedora_version }}
     steps:
-      # fedora 最小容器不带 git；clang-devel 供 rustables 的 bindgen 使用
-      - name: Install toolchain & build deps
-        run: |
-          dnf install -y git cargo gcc clang-devel gtk4-devel libadwaita-devel rpm-build
-          rustc --version
+      # 只打包不编译：仅需 git（checkout）、tar 与 rpm-build
+      - name: Install packaging tools
+        run: dnf install -y git tar rpm-build
 
       - uses: actions/checkout@v4
 
@@ -107,25 +133,18 @@ jobs:
             *) echo "::error::tag 必须形如 v1.2.3 或 v1.2.3-rc1，当前: $GITHUB_REF_NAME"; exit 1 ;;
           esac
           echo "VER=$VER" >> "$GITHUB_ENV"
-          echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
+          echo "ARCH_RAW=$(uname -m)" >> "$GITHUB_ENV"
           echo "FC=${{ matrix.fedora_version }}" >> "$GITHUB_ENV"
 
-      - name: Build (release, locked)
-        run: cargo build --release --locked
-
-      - name: Stage payload (usr/ tree)
-        run: |
-          PKG=pkg
-          mkdir -p "$PKG/usr/bin"
-          cp target/release/jail "$PKG/usr/bin/jail"
-          XDG_DATA_HOME="$PWD/$PKG/usr/share" ./target/release/jail --install-desktop
-          sed -i -e 's|^Exec=.*|Exec=/usr/bin/jail|' -e 's|^TryExec=.*|TryExec=/usr/bin/jail|' \
-            "$PKG/usr/share/applications/top.llklkl.jail.desktop"
-          rm -f "$PKG/usr/share/applications/mimeinfo.cache"
-          find "$PKG" -type f | sort
+      - uses: actions/download-artifact@v4
+        with:
+          name: payload-${{ env.ARCH_RAW }}
+          path: pkg
 
       - name: Build RPM
         run: |
+          # artifact 传输可能丢失可执行位，显式恢复
+          chmod 755 pkg/usr/bin/jail
           TOP="$HOME/rpmbuild"
           mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
           tar -C pkg -czf "$TOP/SOURCES/jail-$VER-payload.tar.gz" usr
