@@ -1,0 +1,12 @@
+Package: jail
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: llklkl <llklkl@users.noreply.github.com>
+Depends: libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.5)
+Homepage: https://github.com/llklkl/jail
+Description: Linux app launcher with per-app network sandboxing
+ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格）。
+ 每个应用运行于独立 user+network+mount 命名空间，宿主侧按域名/IP
+ 黑白名单限制其网络访问，DNS 按名单拦截（fail closed）。

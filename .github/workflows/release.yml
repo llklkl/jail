@@ -1,0 +1,152 @@
+name: Release packages
+
+# 仅在推送 v 前缀 tag 时触发；master 推送不会运行任何任务。
+# 手动测试方法：git tag v0.0.0-test && git push origin v0.0.0-test（测完可删）。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deb:
+    name: Build DEB (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version / arch from tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          VER="${VER//-/~}" # 0.1.0-rc1 -> 0.1.0~rc1（deb 预发布排序语义）
+          case "$VER" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag 必须形如 v1.2.3 或 v1.2.3-rc1，当前: $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "ARCH=$(uname -m | sed -e 's/^x86_64$/amd64/' -e 's/^aarch64$/arm64/')" >> "$GITHUB_ENV"
+
+      - name: Install GTK4 / libadwaita devel packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
+
+      - name: Build (release, locked)
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          cargo build --release --locked
+
+      - name: Stage payload (usr/ tree)
+        run: |
+          PKG=pkg
+          mkdir -p "$PKG/usr/bin"
+          cp target/release/jail "$PKG/usr/bin/jail"
+          # 借用应用自身的桌面集成逻辑产出 desktop 文件与图标集；
+          # XDG_DATA_HOME 指向暂存目录，不污染 runner 的用户目录。
+          XDG_DATA_HOME="$PWD/$PKG/usr/share" ./target/release/jail --install-desktop
+          # 安装到系统路径后，Exec/TryExec 统一指向 /usr/bin/jail
+          sed -i -e 's|^Exec=.*|Exec=/usr/bin/jail|' -e 's|^TryExec=.*|TryExec=/usr/bin/jail|' \
+            "$PKG/usr/share/applications/top.llklkl.jail.desktop"
+          # desktop-file-utils 存在时 update-desktop-database 会生成此文件，
+          # 未在包清单声明，统一剔除以保证 payload 与 runner 工具链无关
+          rm -f "$PKG/usr/share/applications/mimeinfo.cache"
+          find "$PKG" -type f | sort
+
+      - name: Build DEB
+        run: |
+          PKG=pkg
+          mkdir -p "$PKG/DEBIAN"
+          sed -e "s/@VERSION@/$VER/" -e "s/@ARCH@/$ARCH/" packaging/deb.control > "$PKG/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$PKG" "jail_${VER}_${ARCH}.deb"
+          dpkg-deb --info "jail_${VER}_${ARCH}.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: jail_*.deb
+
+  rpm:
+    name: Build RPM (Fedora)
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:latest
+    steps:
+      # fedora 最小容器不带 git，须先于 checkout 安装
+      - name: Install toolchain & build deps
+        run: |
+          dnf install -y git cargo gcc gtk4-devel libadwaita-devel rpm-build
+          rustc --version
+
+      - uses: actions/checkout@v4
+
+      - name: Derive version / arch from tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          VER="${VER//-/~}" # rpm Version 不允许连字符，~ 表示预发布
+          case "$VER" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag 必须形如 v1.2.3 或 v1.2.3-rc1，当前: $GITHUB_REF_NAME"; exit 1 ;;
+          esac
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
+
+      - name: Build (release, locked)
+        run: cargo build --release --locked
+
+      - name: Stage payload (usr/ tree)
+        run: |
+          PKG=pkg
+          mkdir -p "$PKG/usr/bin"
+          cp target/release/jail "$PKG/usr/bin/jail"
+          XDG_DATA_HOME="$PWD/$PKG/usr/share" ./target/release/jail --install-desktop
+          sed -i -e 's|^Exec=.*|Exec=/usr/bin/jail|' -e 's|^TryExec=.*|TryExec=/usr/bin/jail|' \
+            "$PKG/usr/share/applications/top.llklkl.jail.desktop"
+          rm -f "$PKG/usr/share/applications/mimeinfo.cache"
+          find "$PKG" -type f | sort
+
+      - name: Build RPM
+        run: |
+          TOP="$HOME/rpmbuild"
+          mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
+          tar -C pkg -czf "$TOP/SOURCES/jail-$VER-payload.tar.gz" usr
+          rpmbuild -bb --define "pkgver $VER" --define "_topdir $TOP" packaging/jail.spec
+          find "$TOP/RPMS" -name '*.rpm' -exec cp {} . \;
+          ls -la *.rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: jail-*.rpm
+
+  release:
+    name: Publish GitHub Release
+    needs: [deb, rpm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -la dist/
+          EXTRA=()
+          case "$TAG" in *-*) EXTRA+=(--prerelease) ;; esac # v1.2.3-rc1 等
+          gh release create "$TAG" --title "$TAG" --generate-notes "${EXTRA[@]}" dist/*
+          gh release view "$TAG"
