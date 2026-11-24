@@ -193,6 +193,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          # 只取最终安装包；排除 build 阶段的中间产物 payload-*
+          pattern: "{deb-*,rpm-*}"
           path: dist
           merge-multiple: true
 
