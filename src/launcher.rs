@@ -146,6 +146,10 @@ pub enum LaunchMode {
         bridge_path: String,
         /// JSONL request log for this app (host side).
         log_path: PathBuf,
+        /// Loopback port the in-namespace relay listens on (picked fresh
+        /// per launch, so apps hardcoding their own services on a fixed
+        /// port can never collide with it).
+        proxy_port: u16,
     },
 }
 
@@ -215,11 +219,33 @@ pub fn prepare_launch_in(config_base: &std::path::Path, app: &AppEntry) -> Resul
         &app.id[..8.min(app.id.len())]
     ));
     let _ = std::fs::remove_file(&bridge_path);
+    // Default (and old behavior): fixed port 8080. When the app itself needs
+    // to bind a fixed local port, the per-app "random" option picks a fresh
+    // free port each launch instead.
+    let proxy_port = if app.sandbox.proxy_port_random {
+        pick_proxy_port()?
+    } else {
+        app.sandbox.proxy_port
+    };
     Ok(LaunchMode::Sandboxed {
         allow_path,
         bridge_path: bridge_path.to_string_lossy().into_owned(),
         log_path: logs_dir.join(format!("{}.jsonl", app.id)),
+        proxy_port,
     })
+}
+
+/// Pick a fresh loopback port for the in-namespace relay by binding an
+/// ephemeral port and releasing it immediately. The TOCTOU gap is harmless:
+/// every launch gets its own netns (fresh `CLONE_NEWNET`, only lo), and the
+/// relay binds the port there before the app is exec'd — so the picked port
+/// can never conflict with anything inside that namespace.
+fn pick_proxy_port() -> Result<u16, LaunchError> {
+    let l = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| LaunchError::Sandbox(format!("pick proxy port: {e}")))?;
+    l.local_addr()
+        .map(|a| a.port())
+        .map_err(|e| LaunchError::Sandbox(format!("pick proxy port: {e}")))
 }
 
 /// Default entry point using the real config directory.
@@ -324,6 +350,7 @@ pub fn spawn_app(
             allow_path,
             bridge_path,
             log_path,
+            proxy_port,
         } => {
             // 1. start the host bridge (reads the rules file, enforces it,
             //    writes the request log; re-reads the file on change)
@@ -349,15 +376,17 @@ pub fn spawn_app(
                 "--ns-child",
                 &allow_file,
                 bridge_path,
+                &proxy_port.to_string(),
                 exec,
             ]);
+            let proxy_url = format!("http://127.0.0.1:{proxy_port}");
             for (k, v) in [
-                ("HTTP_PROXY", "http://127.0.0.1:8080"),
-                ("HTTPS_PROXY", "http://127.0.0.1:8080"),
-                ("http_proxy", "http://127.0.0.1:8080"),
-                ("https_proxy", "http://127.0.0.1:8080"),
-                ("ALL_PROXY", "http://127.0.0.1:8080"),
-                ("all_proxy", "http://127.0.0.1:8080"),
+                ("HTTP_PROXY", proxy_url.as_str()),
+                ("HTTPS_PROXY", proxy_url.as_str()),
+                ("http_proxy", proxy_url.as_str()),
+                ("https_proxy", proxy_url.as_str()),
+                ("ALL_PROXY", proxy_url.as_str()),
+                ("all_proxy", proxy_url.as_str()),
                 ("NO_PROXY", "localhost,127.0.0.1"),
                 ("no_proxy", "localhost,127.0.0.1"),
             ] {
@@ -486,6 +515,16 @@ mod tests {
         assert_eq!(strip_exec_quotes("say\"hi\""), "say\"hi\"");
         // a bare pair of quotes is not a valid argument: keep literal
         assert_eq!(strip_exec_quotes("\"\""), "\"\"");
+    }
+
+    #[test]
+    fn pick_proxy_port_returns_valid_port() {
+        // (两次调用的相等性不比较：临时端口段足够大，但偶发碰撞会让断言 flaky)
+        for _ in 0..3 {
+            let p = pick_proxy_port().unwrap();
+            assert!((1024..=65535).contains(&p));
+            assert_ne!(p, 53, "DNS 端口必须保留");
+        }
     }
 
     #[test]

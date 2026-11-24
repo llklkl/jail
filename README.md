@@ -31,7 +31,8 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格），支持按
   - 应用运行在独立 user+network+mount 命名空间中（无需 root），且以**当前用户身份（非 root）**
     运行 —— 命名空间内不持有任何 capability，Electron 应用可正常运行
   - 命名空间内 nftables 策略为 `policy drop`，仅放行 loopback —— 直连一律失败（fail closed）
-  - 唯一出口是代理链路：应用 → 127.0.0.1:8080（HTTP CONNECT）→ 命名空间内 relay
+  - 唯一出口是代理链路：应用 → 127.0.0.1:8080（默认端口，可在沙盒设置改为固定其他端口或
+    每次启动随机，HTTP CONNECT）→ 命名空间内 relay
     → AF_UNIX 桥 → 宿主侧 bridge（执行域名/IP/CIDR 黑白名单校验）→ 互联网
   - DNS：`/etc/resolv.conf` 绑定挂载为 `nameserver 127.0.0.1`，由 relay 经桥转发到宿主解析器
     （宿主侧解析，兼容 VPN / 内网 DNS）

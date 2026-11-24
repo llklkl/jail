@@ -51,9 +51,13 @@ fn main() {
         }
         return;
     }
-    if args.len() >= 3 && args[1] == "--ns-relay" {
+    if args.len() >= 4 && args[1] == "--ns-relay" {
         let socket_path = args[2].clone();
-        if let Err(e) = proxy::run_ns_relay(socket_path) {
+        let Ok(http_port) = args[3].parse::<u16>() else {
+            eprintln!("jail ns-relay: bad proxy port {:?}", args[3]);
+            std::process::exit(1);
+        };
+        if let Err(e) = proxy::run_ns_relay(socket_path, http_port) {
             eprintln!("jail ns-relay: {e}");
             std::process::exit(1);
         }

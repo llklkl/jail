@@ -36,11 +36,19 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
         fake_app.to_string_lossy().into_owned(),
     );
     app.sandbox.enabled = true;
+    // random port: exercise the per-launch port picking end-to-end (the
+    // fixed-port default is the same plumbing with proxy_port = 8080)
+    app.sandbox.proxy_port_random = true;
     // exact entry for the CONNECT host + wildcard exercising subdomain match
     app.sandbox.allow_entries = vec!["www.baidu.com".into(), "*.baidu.com".into()];
 
     let mode = launcher::prepare_launch_in(&cfg_dir, &app).unwrap();
-    let LaunchMode::Sandboxed { log_path, .. } = &mode else {
+    let LaunchMode::Sandboxed {
+        log_path,
+        proxy_port,
+        ..
+    } = &mode
+    else {
         panic!("expected sandboxed mode");
     };
     let logs = OutputLogRegistry::default();
@@ -71,6 +79,12 @@ fn sandboxed_spawn_enforces_allowlist_and_logs() {
     assert!(
         result.contains("dnsblocked=none"),
         "blocked domain's DNS must be refused: {result}"
+    );
+    // proxy env injection: the app saw all_proxy pointing at THIS launch's
+    // random relay port (not a hardcoded one)
+    assert!(
+        result.contains(&format!("proxy=http://127.0.0.1:{proxy_port}")),
+        "injected all_proxy must match the launch's proxy port {proxy_port}: {result}"
     );
 
     // 2. the request log: allowed conn with bytes, denied conn, dns query

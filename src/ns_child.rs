@@ -25,15 +25,18 @@
 use crate::proxy::AllowList;
 use crate::sandbox;
 
-/// Entry point for `jail --ns-child <allow_json> <bridge_sock> <exec...>`.
+/// Entry point for `jail --ns-child <allow_json> <bridge_sock> <proxy_port> <exec...>`.
 pub fn run(args: &[String]) -> Result<(), String> {
     let host_uid = unsafe { libc::getuid() };
-    let [allow_file, bridge_sock, exec @ ..] = args else {
-        return Err("usage: --ns-child <allow_json> <bridge_sock> <exec...>".into());
+    let [allow_file, bridge_sock, port_str, exec @ ..] = args else {
+        return Err("usage: --ns-child <allow_json> <bridge_sock> <proxy_port> <exec...>".into());
     };
     if exec.is_empty() {
         return Err("--ns-child: no exec command given".into());
     }
+    let proxy_port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("--ns-child: bad proxy port {port_str:?}"))?;
     let allow_json = std::fs::read_to_string(allow_file)
         .map_err(|e| format!("read allowlist: {e}"))?;
     let allow: AllowList =
@@ -87,8 +90,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
         )
         .unwrap();
         let flag = std::ffi::CString::new("--ns-relay").unwrap();
+        let port = std::ffi::CString::new(proxy_port.to_string()).unwrap();
         unsafe {
-            libc::execl(exe.as_ptr(), exe.as_ptr(), flag.as_ptr(), sock.as_ptr(), std::ptr::null::<libc::c_char>());
+            libc::execl(
+                exe.as_ptr(),
+                exe.as_ptr(),
+                flag.as_ptr(),
+                sock.as_ptr(),
+                port.as_ptr(),
+                std::ptr::null::<libc::c_char>(),
+            );
         }
         eprintln!(
             "jail ns-child: exec relay: {}",
@@ -100,7 +111,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // 4b. wait for the relay to bind its listeners — the old shell script
     // slept 0.5s here; poll instead so slow machines don't start the app
     // before the proxy exists (curl would fail with connection refused).
-    wait_for_relay();
+    wait_for_relay(proxy_port);
 
     // 5. drop to the mapped uid and exec the app (caps die here)
     unsafe {
@@ -202,15 +213,17 @@ fn bring_lo_up() -> Result<(), String> {
     Ok(())
 }
 
-/// Poll until the relay's HTTP listener accepts on 127.0.0.1:8080 (or ~2s
+/// Poll until the relay's HTTP listener accepts on 127.0.0.1:`port` (or ~2s
 /// elapse — the app will simply fail to proxy if the relay never comes up).
-fn wait_for_relay() {
+fn wait_for_relay(port: u16) {
     use std::net::TcpStream;
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if TcpStream::connect_timeout(
-            &"127.0.0.1:8080".parse().unwrap(),
+            &format!("127.0.0.1:{port}")
+                .parse()
+                .expect("loopback addr parses"),
             Duration::from_millis(100),
         )
         .is_ok()

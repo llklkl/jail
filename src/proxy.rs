@@ -5,8 +5,8 @@
 //! work across network namespaces, which gives us a clean bridge:
 //!
 //! ```text
-//! [app] → 127.0.0.1:8080 (HTTP CONNECT / absolute-URI) → [ns relay] → AF_UNIX → [host bridge] → internet
-//! [app] → 127.0.0.1:53 (DNS)                          → [ns relay] → AF_UNIX → [host bridge] → resolver
+//! [app] → 127.0.0.1:{随机端口} (HTTP CONNECT / absolute-URI)      → [ns relay] → AF_UNIX → [host bridge] → internet
+//! [app] → 127.0.0.1:53 (DNS)                                     → [ns relay] → AF_UNIX → [host bridge] → resolver
 //! ```
 //!
 //! The host bridge enforces the allowlist (domains + IPs + CIDR), logs every
@@ -900,10 +900,11 @@ fn parse_absolute_http(target: &str) -> Option<(String, u16)> {
 // NS SIDE
 // ---------------------------------------------------------------------------
 
-/// NS SIDE: HTTP proxy on 127.0.0.1:8080 (CONNECT + absolute-URI) and DNS on
-/// 127.0.0.1:53 (TCP + UDP), relaying everything over `bridge_path`.
-pub fn run_ns_relay(bridge_path: String) -> std::io::Result<()> {
-    let http = TcpListener::bind("127.0.0.1:8080")?;
+/// NS SIDE: HTTP proxy on 127.0.0.1:`http_port` (CONNECT + absolute-URI;
+/// picked randomly per launch) and DNS on 127.0.0.1:53 (TCP + UDP — fixed,
+/// resolv.conf points there), relaying everything over `bridge_path`.
+pub fn run_ns_relay(bridge_path: String, http_port: u16) -> std::io::Result<()> {
+    let http = TcpListener::bind(("127.0.0.1", http_port))?;
     let dns = TcpListener::bind("127.0.0.1:53")?;
     let bridge = Arc::new(bridge_path.clone());
 

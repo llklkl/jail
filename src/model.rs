@@ -101,6 +101,10 @@ struct RawConfig {
     #[serde(default)]
     allow_mode: Option<AllowMode>,
     #[serde(default)]
+    proxy_port: Option<u16>,
+    #[serde(default)]
+    proxy_port_random: Option<bool>,
+    #[serde(default)]
     enabled: bool,
 }
 
@@ -124,9 +128,14 @@ impl From<RawConfig> for SandboxConfig {
             allow_entries: entries,
             allow_loopback: raw.allow_loopback.unwrap_or(true),
             allow_mode: raw.allow_mode.unwrap_or_default(),
+            proxy_port: raw.proxy_port.unwrap_or(DEFAULT_PROXY_PORT),
+            proxy_port_random: raw.proxy_port_random.unwrap_or(false),
         }
     }
 }
+
+/// Default proxy listen port inside the sandbox namespace.
+pub const DEFAULT_PROXY_PORT: u16 = 8080;
 
 /// Per-application sandbox configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +153,18 @@ pub struct SandboxConfig {
     /// How `allow_entries` is interpreted (default: whitelist).
     #[serde(default)]
     pub allow_mode: AllowMode,
+    /// Proxy listen port inside the namespace (default 8080). Used only when
+    /// `proxy_port_random` is false.
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
+    /// Pick a random free port per launch instead of `proxy_port` — useful
+    /// when the app itself wants to bind a fixed local port (e.g. 8080).
+    #[serde(default)]
+    pub proxy_port_random: bool,
+}
+
+fn default_proxy_port() -> u16 {
+    DEFAULT_PROXY_PORT
 }
 
 impl SandboxConfig {}
@@ -155,6 +176,8 @@ impl Default for SandboxConfig {
             allow_entries: Vec::new(),
             allow_loopback: true,
             allow_mode: AllowMode::default(),
+            proxy_port: DEFAULT_PROXY_PORT,
+            proxy_port_random: false,
         }
     }
 }
@@ -334,12 +357,23 @@ mod tests {
         // loopback default when absent
         let cfg: SandboxConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.allow_loopback);
+        // proxy port defaults: fixed 8080, not random
+        let cfg: SandboxConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.proxy_port, DEFAULT_PROXY_PORT);
+        assert!(!cfg.proxy_port_random);
+        // explicit values round-trip through the raw migration
+        let cfg: SandboxConfig =
+            serde_json::from_str(r#"{"proxy_port":3128,"proxy_port_random":true}"#).unwrap();
+        assert_eq!(cfg.proxy_port, 3128);
+        assert!(cfg.proxy_port_random);
         // serialization writes only the new field
         let cfg = SandboxConfig {
             enabled: true,
             allow_entries: vec!["x.com".into()],
             allow_loopback: false,
             allow_mode: AllowMode::Whitelist,
+            proxy_port: DEFAULT_PROXY_PORT,
+            proxy_port_random: false,
         };
         let text = serde_json::to_string(&cfg).unwrap();
         assert!(!text.contains("allow_domains"));

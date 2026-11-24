@@ -132,6 +132,29 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
     allow_group.add(&loopback_switch);
     page.add(&allow_group);
 
+    // --- proxy port group ----------------------------------------------------
+    let port_group = adw::PreferencesGroup::new();
+    port_group.set_title("代理端口");
+    let random_port_switch = adw::SwitchRow::builder()
+        .title("每次启动随机端口")
+        .subtitle("自动挑选空闲端口；应用自身需要绑定固定本地端口（如 8080）时开启")
+        .active(app.sandbox.proxy_port_random)
+        .build();
+    port_group.add(&random_port_switch);
+    let port_spin = adw::SpinRow::with_range(1024.0, 65535.0, 1.0);
+    port_spin.set_title("固定端口");
+    port_spin.set_subtitle("命名空间内代理监听端口，默认 8080");
+    port_spin.set_value(f64::from(app.sandbox.proxy_port));
+    port_spin.set_sensitive(!app.sandbox.proxy_port_random);
+    port_group.add(&port_spin);
+    {
+        let spin = port_spin.clone();
+        random_port_switch.connect_active_notify(move |sw| {
+            spin.set_sensitive(!sw.is_active());
+        });
+    }
+    page.add(&port_group);
+
     // validation feedback + add on apply (Enter key or apply button)
     {
         let input_row_ref = input_row.clone();
@@ -190,6 +213,8 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
         let enable_switch = enable_switch.clone();
         let entries_list = entries_list.clone();
         let mode_switch = mode_switch.clone();
+        let random_port_switch = random_port_switch.clone();
+        let port_spin = port_spin.clone();
         save_btn.connect_clicked(move |_| {
             let enabled = enable_switch.is_active();
             let loopback = loopback_switch.is_active();
@@ -199,6 +224,8 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
             } else {
                 crate::model::AllowMode::Whitelist
             };
+            let proxy_port_random = random_port_switch.is_active();
+            let proxy_port = port_spin.value() as u16;
 
             let app_id = {
                 let mut apps = state.apps.borrow_mut();
@@ -208,6 +235,8 @@ pub fn present(win: &adw::ApplicationWindow, state: &Rc<AppState>, id: &str) {
                 app.sandbox.allow_entries = entries;
                 app.sandbox.allow_loopback = loopback;
                 app.sandbox.allow_mode = mode;
+                app.sandbox.proxy_port = proxy_port;
+                app.sandbox.proxy_port_random = proxy_port_random;
                 app.id.clone()
             };
             // rewrite the rules file so a running bridge picks up the change

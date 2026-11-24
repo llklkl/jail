@@ -155,7 +155,6 @@ mod tests {
         // crashed the log viewer on its next refresh.
         let log = OutputLog::new();
         let chunk = format!("{}\n", "中文字符日志输出".repeat(4000)); // multibyte
-        let chunk_bytes = chunk.len() as u64;
         // push ~5 MiB through in 8 KiB-ish chunks, like the pipe pump does
         for _ in 0..50 {
             let bytes = chunk.as_bytes();
