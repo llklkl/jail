@@ -2,12 +2,12 @@
 # CI（Fedora 容器，matrix 覆盖受支持的发布版）编译 release 后，把暂存的
 # usr/ 树打成 payload tar.gz 作为 Source0 交给本 spec；由流水线注入：
 #   rpmbuild --define 'pkgver x.y.z' --define 'dist .fcNN'
-# 仓库尚无 LICENSE 文件，故暂不写 License 头（rpmbuild 不强制，rpmlint 会提示）。
 
 Name:           jail
 Version:        %{pkgver}
 Release:        1%{?dist}
 Summary:        Linux app launcher with per-app network sandboxing
+License:        MIT
 
 Source0:        jail-%{pkgver}-payload.tar.gz
 
@@ -25,6 +25,7 @@ mkdir -p %{buildroot}
 cp -a usr/. %{buildroot}/
 
 %files
+%license /usr/share/licenses/jail/LICENSE
 /usr/bin/jail
 /usr/share/applications/top.llklkl.jail.desktop
 /usr/share/icons/hicolor/64x64/apps/top.llklkl.jail.png

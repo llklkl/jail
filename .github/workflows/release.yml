@@ -58,6 +58,11 @@ jobs:
           # desktop-file-utils 存在时 update-desktop-database 会生成此文件，
           # 未在包清单声明，统一剔除以保证 payload 与 runner 工具链无关
           rm -f "$PKG/usr/share/applications/mimeinfo.cache"
+          # 许可证文件：rpm 用 /usr/share/licenses/jail/LICENSE（spec %license），
+          # deb 用 /usr/share/doc/jail/copyright（dpkg 惯例）
+          mkdir -p "$PKG/usr/share/licenses/jail" "$PKG/usr/share/doc/jail"
+          cp LICENSE "$PKG/usr/share/licenses/jail/LICENSE"
+          cp LICENSE "$PKG/usr/share/doc/jail/copyright"
           find "$PKG" -type f | sort
 
       - uses: actions/upload-artifact@v4
