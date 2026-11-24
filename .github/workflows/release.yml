@@ -150,9 +150,14 @@ jobs:
         run: |
           # artifact 传输可能丢失可执行位，显式恢复
           chmod 755 pkg/usr/bin/jail
+          # payload tarball 用标准上游布局（顶层 jail-<版本>/，usr 在其下）：
+          # rpm >= 6.1 的 %prep 会自动解包全部 Source 并 cd 进 buildsubdir
+          # （默认 <name>-<version>），顶层必须是该目录名
+          mkdir -p "pkg/jail-$VER"
+          mv pkg/usr "pkg/jail-$VER/usr"
           TOP="$HOME/rpmbuild"
           mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
-          tar -C pkg -czf "$TOP/SOURCES/jail-$VER-payload.tar.gz" usr
+          tar -C pkg -czf "$TOP/SOURCES/jail-$VER-payload.tar.gz" "jail-$VER"
           # dist 宏注入 Release: 1.fc44 / 1.fc45，产物文件名按发行版区分
           rpmbuild -bb \
             --define "pkgver $VER" \

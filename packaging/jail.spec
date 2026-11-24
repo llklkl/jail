@@ -18,15 +18,19 @@ Linux 桌面应用启动器（Rust + GTK4/libadwaita，MD3 风格）。
 校验，DNS 按名单直接拦截（fail closed）。
 
 %prep
-# 不用 %setup：rpm 6.1 的 %setup -c + rpmuncompress 对顶层非 name-version
-# 布局的 payload 会解出空目录（v0.1.0 CI 实测）。手动解包到 %{builddir}
-# 下的固定位置，%install 用同一绝对路径取用，对 rpm 4.x/6.x 都成立。
-mkdir -p %{builddir}/payload
-tar -xzf %{SOURCE0} -C %{builddir}/payload
+# payload tarball 顶层为 %{name}-%{version}/（标准上游布局，CI 打包时生成）。
+# rpm >= 6.1：%prep 自动解包全部 Source 到 %{builddir} 并 cd 进
+#   buildsubdir（默认 <name>-<version>），文件已就位，无需动作；
+# rpm 4.x：不自动解包 —— 此处手动解到同一位置（--strip-components=1
+#   去掉顶层目录），保证两个版本代次行为一致。
+if [ ! -d %{builddir}/%{name}-%{version}/usr ]; then
+    mkdir -p %{builddir}/%{name}-%{version}
+    tar -xzf %{SOURCE0} -C %{builddir}/%{name}-%{version} --strip-components=1
+fi
 
 %install
 mkdir -p %{buildroot}
-cp -a %{builddir}/payload/usr/. %{buildroot}/
+cp -a %{builddir}/%{name}-%{version}/usr/. %{buildroot}/
 
 %files
 %license /usr/share/licenses/jail/LICENSE
